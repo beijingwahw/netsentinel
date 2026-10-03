@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地模拟举报表单(非官方网站)</title>
+  <style>
+    body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 0; background: #f5f6f8; color: #222; }
+    .banner { background: #b3261e; color: #fff; font-weight: bold; padding: 14px 20px; font-size: 18px; letter-spacing: 1px; }
+    .banner small { display: block; font-weight: normal; font-size: 12px; opacity: .9; margin-top: 4px; }
+    main { max-width: 560px; margin: 24px auto; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 20px 24px; }
+    h1 { font-size: 18px; margin: 0 0 16px; }
+    label { display: block; margin: 12px 0; font-size: 14px; }
+    input[type="text"], input[type="url"], input[type="tel"], select, textarea {
+      display: block; width: 100%; box-sizing: border-box; margin-top: 4px;
+      padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; font-size: 14px;
+    }
+    input[readonly] { background: #eee; color: #666; }
+    .hint { font-size: 12px; color: #b3261e; margin-top: 2px; }
+    #report-submit { margin-top: 16px; padding: 8px 28px; font-size: 15px;
+      background: #1a73e8; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
+    #ok { margin-top: 16px; padding: 10px 14px; background: #e6f4ea; border: 1px solid #34a853;
+      color: #1e7e34; border-radius: 4px; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <!-- A15 本地测试夹具:绝不用于访问真实举报门户 -->
+  <header class="banner">
+    本地模拟页面——非官方网站
+    <small>NetSentinel 开发/测试专用,不连接任何真实举报服务</small>
+  </header>
+  <main>
+    <h1>违法和不良信息举报表单(模拟)</h1>
+    <form id="report-form">
+      <label>举报链接
+        <input id="report-url" name="url" type="url" placeholder="http://(待举报站点链接)">
+      </label>
+      <label>信息类型
+        <select id="report-type" name="type">
+          <option value="色情低俗信息">色情低俗信息</option>
+          <option value="淫秽色情类">淫秽色情类</option>
+        </select>
+      </label>
+      <label>具体描述
+        <textarea id="report-desc" name="desc" rows="4" placeholder="请描述事实与证据情况"></textarea>
+      </label>
+      <label>举报人姓名
+        <input id="report-name" name="name" type="text" placeholder="选填">
+      </label>
+      <label>联系电话
+        <input id="report-phone" name="phone" type="tel" placeholder="选填">
+      </label>
+      <label>附件(证据包 zip,由人工上传)
+        <input id="report-file" name="file" type="file" accept=".zip">
+      </label>
+      <label>验证码
+        <input id="report-captcha" name="captcha" type="text" readonly placeholder="只允许人工输入">
+        <span class="hint">安全红线:验证码绝不自动识别/填写,仅人工输入</span>
+      </label>
+      <button id="report-submit" type="submit">提交</button>
+    </form>
+    <div id="ok" hidden>已提交(模拟)</div>
+  </main>
+  <script>
+    // 模拟提交:仅前端显示结果,不向任何服务发送数据
+    document.getElementById("report-form").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var ok = document.getElementById("ok");
+      if (ok.hasAttribute("hidden")) {
+        ok.removeAttribute("hidden");
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,116 @@
+# NetSentinel(净网哨兵)配置示例 —— 键名与 netsentinel/contracts.py::Config 字段一一对应
+# 安全默认:allow_network=false(仅放行本机),dry_run_default=true(不真正提交)
+
+# ---- 判定阈值 ----
+nsfw_threshold: 0.90      # 单图集成分达到该值视为"达标色情图"
+review_threshold: 0.50    # 站点聚合分达到该值即进入人工复核
+prob_count_line: 0.80     # 单图分 >= 该值计入达标图片数
+min_nsw_images: 3         # 达标图片数门槛
+min_image_px: 200         # 小于该尺寸的图片(图标等)不参与判定
+
+# ---- 抓取预算 ----
+max_pages: 5
+max_images_per_page: 12
+max_image_mb: 8
+fetch_timeout_s: 15
+fetch_delay_s: 1.0        # 相邻请求最小间隔(礼貌抓取)
+respect_robots: true
+allow_network: false      # true 时才允许访问外网(运营者显式开启)
+
+# ---- 分类器:stub(离线)/ nudenet / clip ----
+classifier: stub
+ensemble_members: [stub]  # 多个则做集成,如 [nudenet, clip]
+
+# ---- 提交安全(红线,谨慎调整) ----
+human_gate_required: true # 强制人工门,不可关闭
+dry_run_default: true     # 默认干跑
+submit_min_interval_s: 60 # 两次提交最小间隔
+submit_max_per_day: 5     # 每日最大提交数
+
+# ---- 举报门户入口(上线前需人工核验真实表单结构) ----
+portal_12377_base: "https://www.12377.cn"
+portal_shdf_base: "https://www.shdf.gov.cn"
+
+# ---- V4:全平台视觉模型(语法 classifier: 提供方[:模型]) ----
+vlm_provider: glm          # classifier 不带前缀时的默认提供方
+vlm_provider_models: {}    # 提供方 -> 默认模型覆盖,如 {openai: gpt-4o-mini}
+vlm_provider_base_urls: {} # 提供方 -> 端点覆盖(私有化/代理场景)
+vlm_api_keys: {}           # 提供方 -> 密钥(推荐改用环境变量/密钥环,勿提交入库)
+vlm_fallback_chain: []     # 故障转移链,如 [glm:glm-5.3-flash, openai:gpt-4o-mini, ollama:llava]
+vlm_request_timeout_s: 90
+vlm_max_image_mb: 8
+# 示例:classifier: openai:gpt-4o-mini / qwen:qwen-vl-max / gemini:gemini-2.0-flash
+#       anthropic / ollama:llava(本地,免 vlm_online)
+
+# ---- V6:大批量筛选 / 归纳同名 / 批量举报 ----
+group_merge_phash_overlap: 0.3   # 组间合并:图片指纹重叠率阈值
+group_merge_template: true
+batch_max_items: 20              # 单批最大举报条数(1~50)
+batch_item_interval_s: 90        # 批内间隔(须 >= submit_min_interval_s,不放宽)
+batch_require_attestation: true  # 批量须逐组"人工核实"声明(留痕)
+
+# ---- V6.5:搜索引擎线索发现(优先 Yandex,自定义关键词) ----
+discovery_online: false          # 发现层外呼总开关(默认关:零外呼)
+discovery_engine: yandex         # yandex(官方 XML API)/ searxng(自托管)/ mock
+discovery_max_per_query: 10
+discovery_max_total: 100
+discovery_query_delay_s: 3.0     # 引擎礼貌限速(下限 1s)
+discovery_cache_db: data/discovery_cache.db
+discovery_cache_ttl_h: 168
+yandex_xml_user: ""              # 或环境变量 NETSENTINEL_YANDEX_USER
+yandex_xml_key: ""               # 或环境变量 NETSENTINEL_YANDEX_KEY
+searxng_base_url: "http://127.0.0.1:8888"
+
+# ---- 路径 ----
+data_dir: data
+evidence_dir: data/evidence
+db_path: data/review_queue.db
+audit_path: data/audit.jsonl
+log_path: data/logs/netsentinel.log
+
+# ---- V9:CPU 自适应三档并发 + 收官汇总代理 ----
+concurrency_tier: mid     # low(cores/4 后台) / mid(cores/2 默认) / high(cores-reserve,最大限度压榨本地计算)
+concurrency_auto: false   # 首次运行自动探测 CPU 并写入建议档位(用户显式配置优先)
+cpu_reserve: 1            # 高档保留核心数(0=全压榨;对外礼貌间隔与举报频控不受档位影响)
+summary_agent_enabled: true  # 批量跑完由结案代理分类汇总并进入举报准备(仍全人工门)
+
+# ---- V10:举报理由自动生成 + 个人信息模板 ----
+# 举报理由:自动生成(≤39 字,基于已核实事实;离线模板保底,GLM 可选压缩措辞),作为描述首行自动填入
+reporter_name: ""            # 举报人姓名(建议改用 profile.yaml 模板或环境变量)
+reporter_phone: ""           # 举报人电话(只进表单不进日志,红线 39)
+profile_path: "profile.yaml" # 个人信息模板文件(用户自主配置;参考 profile.yaml.example)
+
+# ---- V11:图谱通电 / 团伙判定 / 校准集成权重 / 级联预算 / 弃权阈值 / 证据包签名(默认值与 contracts.py 一字不差) ----
+graph_wire: false                    # A194 图谱通电总开关(false = 现状零通电)
+gang_mode: connectivity              # A194 团伙判定:connectivity(现状)/ community
+gang_weight_threshold: 0.3           # A194 community 模式边权重下限 [0,1](connectivity 模式忽略)
+gang_template_weight_factor: 0.5     # A194 community 模式 shared_template 降权系数 [0,1]
+gang_resolution: 1.0                 # A194 community 模式 Louvain 分辨率(必须 > 0)
+ensemble_reliability_weights: false  # 校准驱动集成权重(false = 现状等权)
+cascade_risk_budget: null            # A197 级联风险预算 [0,1](null = 静态带,冷启动)
+abstain_threshold: 0.35              # A196 分歧弃权阈值 [0,1](缺省 0.35 对齐 arbiter)
+bundle_sign_algo: hmac-sha256        # A192 证据包签名算法:hmac-sha256(默认)/ ed25519
+ed25519_seed_hex: null               # A192 Ed25519 私钥 seed(64 位十六进制;null = 走 HMAC)
+# 安全敏感键占位示例(勿提交真实私钥;须恰为 64 位十六进制,长度/字符不符会在加载时中文报错):
+#   ed25519_seed_hex: "3f2a00000000000000000000000000000000000000000000000000000000c9e1"
+tsa_url: null                        # A192 RFC3161-lite TSA 地址(null = 全离线本地证明)
+
+# ---- V12:全链追踪 / 分歧弃权(默认关 = 现状) ----
+trace_enabled: false                 # 全链追踪开关(false = 现状零 trace/零 span)
+abstain_enabled: false               # 分歧弃权开关(false = 现状不弃权/不入队提权)
+
+# ---- V13:动态 TTL / 多表 LSH 持久库 / 守卫模型(默认值与 contracts.py 一字不差) ----
+dynamic_ttl: false                   # A211 动态 TTL 开关(false = 现状固定库级 TTL,零图谱咨询)
+phash_mt_lsh_db: null                # A204 多表 LSH 持久库路径(null = 按 phash_db 推导 <phash_db>.mtlsh)
+guard_model_path: ""                 # A217 守卫模型本地目录(空 = 未注入,由构造参数决定)
+guard_family: ""                     # A217 守卫模型族(空 = 按 model_path 推断;shieldgemma2/llamaguard/custom-prompt)
+
+# ---- V14:贝叶斯可靠性回流(默认关 = 现状等权) ----
+bayes_reliability: false             # A223 贝叶斯可靠性权重回流开关(false = 现状等权;开启时优先于 ensemble_reliability_weights)
+bayes_half_life: null                # A223 贝叶斯遗忘半衰期,单位天(null = 关闭遗忘 = 现状;正值 = 漂移感知)
+
+# ---- 附注(A243):VLM 成本旁路落账不是配置文件键 ----
+# 开关 cost_ledger_enabled 与批次标识 run_id 均为程序内 cfg 附加实例属性
+# (getattr 动态读取,缺省 False/None = 现状零落账/无批次标识);写进本文件
+# 会按未知键告警忽略。开启方式:调用入口处 cfg.cost_ledger_enabled = True,
+# 收官流程沿 cfg 原对象透传链挂 cfg.run_id(A232 接线指引 ②)。

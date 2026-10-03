@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地模拟页面——12377 举报表单模拟·改版演练页(非官方)</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #eef1f6;
+    color: #1f2937;
+    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  }
+  .banner {
+    background: #1f3a93;
+    border-bottom: 3px solid #12275f;
+    color: #fff;
+    font-weight: bold;
+    font-size: 18px;
+    text-align: center;
+    padding: 14px 12px;
+    letter-spacing: 1px;
+  }
+  .wrap {
+    max-width: 720px;
+    margin: 24px auto;
+    background: #fff;
+    border: 1px solid #d7dce5;
+    border-radius: 8px;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  .sub { color: #6b7280; font-size: 13px; margin: 0 0 18px; }
+  label { display: block; margin: 14px 0 4px; font-size: 14px; }
+  .req { color: #dc2626; }
+  input[type="text"], select, textarea {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #9ca3af;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+  textarea { min-height: 96px; resize: vertical; }
+  #ns-captcha { background: #f3f4f6; cursor: not-allowed; }
+  .hint { color: #9ca3af; font-size: 12px; margin-top: 4px; }
+  #ns-submit {
+    margin-top: 20px;
+    width: 100%;
+    padding: 10px;
+    background: #1f3a93;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 16px;
+    cursor: pointer;
+  }
+  #ns-submit:hover { background: #12275f; }
+  #ns-ok {
+    display: none;
+    margin-top: 16px;
+    padding: 12px;
+    background: #e8f5e9;
+    border: 1px solid #4caf50;
+    color: #2e7d32;
+    border-radius: 4px;
+    text-align: center;
+    font-weight: bold;
+  }
+  #ns-err {
+    display: none;
+    margin-top: 16px;
+    padding: 12px;
+    background: #fff2f0;
+    border: 1px solid #d93026;
+    color: #d93026;
+    border-radius: 4px;
+    text-align: center;
+    font-weight: bold;
+  }
+  footer { text-align: center; color: #9ca3af; font-size: 12px; margin: 18px 0 30px; }
+</style>
+</head>
+<body>
+  <div class="banner">本地模拟页面——非官方网站(12377 举报表单模拟·V13 改版演练页,id 全换、aria/label 保留)</div>
+  <div class="wrap">
+    <h1>违法和不良信息举报(改版演练表单)</h1>
+    <p class="sub">本页面模拟"门户改版后字段 id 全部更换"的场景,仅用于 NetSentinel
+      自愈选择器候选链(Healenium 式 self-healing)的离线演练;仅限本地测试,
+      点击提交不会向任何真实站点发送数据。</p>
+    <form id="ns-form" onsubmit="return false;">
+      <label for="ns-link">举报链接(<span class="req">*</span>)</label>
+      <input type="text" id="ns-link" name="link" placeholder="要举报的站点链接">
+
+      <label for="ns-type">举报类型(<span class="req">*</span>)</label>
+      <select id="ns-type" name="type">
+        <option value="">-- 请选择举报类型 --</option>
+        <option value="色情低俗信息">色情低俗信息</option>
+        <option value="淫秽色情类">淫秽色情类</option>
+        <option value="网络赌博类">网络赌博类</option>
+        <option value="网络诈骗类">网络诈骗类</option>
+        <option value="侵权假冒类">侵权假冒类</option>
+      </select>
+
+      <label for="ns-desc">具体描述(<span class="req">*</span>)</label>
+      <textarea id="ns-desc" name="desc"
+        placeholder="请描述违法事实、涉及页面与证据情况(不少于 30 字)"></textarea>
+
+      <label for="ns-name">举报人姓名</label>
+      <input type="text" id="ns-name" name="name" placeholder="选填">
+
+      <label for="ns-phone">联系电话</label>
+      <input type="text" id="ns-phone" name="phone" placeholder="选填">
+
+      <label for="ns-email">电子邮箱</label>
+      <input type="text" id="ns-email" name="email" placeholder="选填;接收处理结果">
+
+      <label for="ns-idcard">身份证号(实名举报)</label>
+      <input type="text" id="ns-idcard" name="idcard" placeholder="选填;部分门户必填">
+
+      <label for="ns-address">通讯地址</label>
+      <input type="text" id="ns-address" name="address" placeholder="选填;邮寄书面回执">
+
+      <label for="ns-postcode">邮政编码</label>
+      <input type="text" id="ns-postcode" name="postcode" placeholder="选填">
+
+      <label for="ns-org">单位名称</label>
+      <input type="text" id="ns-org" name="org" placeholder="举报人类型=企业/组织时填">
+
+      <label for="ns-file">附件(证据包 zip,由人工在人工门阶段上传)</label>
+      <input type="file" id="ns-file" name="file" accept=".zip,.rar,.7z,.jpg,.jpeg,.png">
+
+      <label for="ns-captcha">验证码(仅限人工输入)</label>
+      <input type="text" id="ns-captcha" name="captcha"
+        placeholder="验证码:仅供人工输入(模拟站任意4位)">
+      <p class="hint">安全红线:自动化程序不得识别或填写验证码;验证码只允许人工输入。</p>
+
+      <button type="button" id="ns-submit">提交举报(模拟)</button>
+    </form>
+    <div id="ns-ok">举报已受理(本地模拟·改版演练)</div>
+    <div id="ns-err">请完整填写</div>
+  </div>
+  <footer>NetSentinel 本地模拟门户(改版演练页)· 仅限本地离线开发测试使用</footer>
+<script>
+(function () {
+  "use strict";
+  function val(id) {
+    var el = document.getElementById(id);
+    return el ? String(el.value || "").trim() : "";
+  }
+  document.getElementById("ns-submit").addEventListener("click", function () {
+    var okBox = document.getElementById("ns-ok");
+    var errBox = document.getElementById("ns-err");
+    okBox.style.display = "none";
+    errBox.style.display = "none";
+    if (val("ns-link") && val("ns-desc")) {
+      okBox.style.display = "block";
+    } else {
+      errBox.style.display = "block";
+    }
+  });
+})();
+</script>
+</body>
+</html>

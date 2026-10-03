@@ -1,0 +1,62 @@
+# =====================================================================
+# NetSentinel 声明式政策示例(A49)
+#
+# 用途:运营者用本文件描述"什么判级 / 什么风险走什么流程",代码不再
+#       硬编码分流逻辑。复制为 policy.yaml 并按需修改(Config.policy_path
+#       默认指向 ./policy.yaml);文件缺失时引擎自动使用内置默认政策
+#      (单条 queue-all,全部进入人工复核),不会漏审。
+#
+# 红线声明(CONTRACTS-V3 §0 红线 11,政策只能增加审批、不能削弱人工门):
+#   - 任何 action(queue / notify / ignore / four_eyes)都不能跳过
+#     HUMAN_GATE 与人工确认,本文件不存在"自动提交"语义;
+#   - four_eyes 仅表示在人工门之上追加第二审核人(四眼原则,只增审批)。
+#
+# 规则格式(顶层为列表,自上而下匹配,首条命中即生效,顺序即优先级;
+# 全部未命中 → 兜底:进入人工复核):
+#   - name:   规则名,唯一标识(必填,非空字符串)
+#     when:   匹配条件,列出者全部满足才算命中(AND);省略 = 匹配一切
+#       verdict:      判级列表,如 [nsfw, suspect],报告 verdict 在列表内才命中
+#       min_agg:      站点聚合色情概率下限(agg_nsw_prob >= 该值才命中,0~1)
+#       min_url_risk: URL 风险下限(intel["url"]["risk"] >= 该值才命中,0~1;
+#                     报告缺少该情报时视为不命中——字段存在才比较)
+#       needs_review: 与报告 needs_review 相等才命中(true/false)
+#     action: queue | notify | ignore | four_eyes(各动作中文说明见
+#             describe_actions(),加载时非法值会被拒绝)
+#     note:   中文备注(可选,会原样进入 Decision.note)
+#
+# 加载与性能(V5):load_policy 解析本文件时即完成 when 条件编译(规则
+#   只解析一次),decide 热路径直接调用缓存的判断闭包;每次分流决策按
+#   生效动作计入遥测计数 policy.decide.<action>(queue/notify/ignore/
+#   four_eyes,未命中任何规则的兜底同样计 policy.decide.queue),
+#   运营侧可据此统计各流程的实际命中量。
+# =====================================================================
+
+- name: high_confidence_four_eyes
+  when:
+    verdict: [nsfw]
+    min_agg: 0.90
+  action: four_eyes
+  note: 高置信色情站点:进入四眼复核,在人工门之上追加第二审核人后才能提交
+
+- name: url_risk_notify
+  when:
+    min_url_risk: 0.70
+  action: notify
+  note: 仅 URL 风险高(图像证据尚不足以定级)时发送提醒,不自动升级、不自动提交
+
+- name: clean_log_only
+  when:
+    verdict: [clean]
+  action: ignore
+  note: 判级 clean 仅记录、不再重复提醒;已进入人工复核队列的条目不受影响
+
+# 说明:clean 且 URL 风险高的报告会被上一条 url_risk_notify 先命中——
+# 顺序即优先级,如需"clean 一律仅记录"请把 clean_log_only 挪到最前。
+#
+# 更多条件示例(取消注释即生效):
+# - name: needs_review_queue
+#   when:
+#     needs_review: true
+#   action: queue
+#   note: 任何被标记"需人工复核"的站点进入人工复核队列
+# =====================================================================

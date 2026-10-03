@@ -1,0 +1,15 @@
+# 个人信息模板(举报时自动填入表单;复制为 profile.yaml 并填写,勿提交版本库)
+# 两门户(12377 / 扫黄打非)共用此模板;空字段自动跳过不填
+# 优先级:调用方显式传参 > 环境变量 NETSENTINEL_REPORTER_<字段名> > 本文件 > config.yaml
+
+# ── 必填 ──
+reporter_name: "你的姓名"                # 举报人姓名(必填)
+reporter_phone: "13800000000"           # 联系电话(必填;接收回执)
+
+# ── 选填(部分门户必填) ──
+reporter_email: "you@example.com"       # 电子邮箱(接收处理结果)
+reporter_id: "110101199001011234"       # 身份证号(实名举报;部分门户必填)
+reporter_address: "北京市朝阳区XX路XX号"  # 通讯地址(邮寄书面回执)
+reporter_postcode: "100000"             # 邮政编码
+reporter_type: "个人"                    # 举报人类型:个人/企业/组织
+reporter_org: ""                        # 单位名称(类型=企业/组织时必填)

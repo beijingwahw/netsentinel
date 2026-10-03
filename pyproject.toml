@@ -1,0 +1,159 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netsentinel"
+version = "0.1.0"
+description = "NetSentinel 净网哨兵:图像识别辅助筛查疑似色情网站,人工确认后辅助向 12377 / 扫黄打非 提交举报"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.40"]
+vision = ["nudenet>=3.3", "Pillow>=10"]
+clip = ["transformers>=4.30", "torch>=2.0", "Pillow>=10"]
+ui = ["streamlit>=1.30"]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+fast = ["numpy>=1.26"]
+analytics = ["pyarrow>=15"]
+dev = ["pytest>=7.0", "httpx>=0.27", "hypothesis>=6.100", "importlinter>=2.0"]
+
+[project.scripts]
+netsentinel = "netsentinel.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["netsentinel*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# ---------------------------------------------------------------------------
+# import-linter 声明式架构适应度(A199;dev extra 可选,`lint-imports` 执行)
+#
+# 纪律:只声明"现状真实成立"的规则(全部先经 AST 全量扫描验证,
+# 宁少勿错)。已知与直觉相反的两处事实,按事实声明:
+#   1. submit → agent 真实存在(submit.batch_precheck 复用
+#      agent.sequential_report),故 agent 排在 submit 之下的层,
+#      而非"submit 不得 import agent";
+#   2. decision → intel 真实存在(batch_review/dedup_policy/sprt),
+#      故 decision 与 intel 分层,不并置同层。
+# 未列入任何层的组(ops / security / pipeline / telemetry / discovery /
+# evidence / notify / report / policy / service / setup / storage /
+# logging_util / modelmgr / batchflow / finishflow / golive /
+# telemetry_export / telemetry_trace)不受分层契约约束;其包级
+# __init__ 均为空壳,不构成间接上溯链。
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_package = "netsentinel"
+
+# 主干分层:上层可依赖下层,反向即违约(自上而下读取)。
+[[tool.importlinter.contracts]]
+name = "NetSentinel 主干分层契约(contracts 基座 → 业务顶层)"
+type = "layers"
+layers = [
+    "netsentinel.cli",      # 复核 TUI:终端消费者,不被任何模块依赖
+    "netsentinel.submit",   # 人工门提交流水(依赖 agent/crawler/decision/vision)
+    "netsentinel.decision", # 判决 / 复核 / 融合(依赖 intel)
+    "netsentinel.vision",   # 视觉识别(依赖 config)
+    "netsentinel.intel",    # 情报内核(phash / canonical / graph)
+    "netsentinel.crawler",  # 抓取
+    "netsentinel.agent",    # 结案代理(被 submit 编排,自身只依赖 contracts)
+    "netsentinel.config",   # 配置装载
+    "netsentinel.mathx",    # 数值微库(零内部依赖)
+    "netsentinel.contracts",# 契约基座(被 88 处 import,最底层叶子)
+]
+
+# 契约基座零内部依赖:contracts.py 现状零内部 import,必须保持叶子地位。
+[[tool.importlinter.contracts]]
+name = "contracts 基座零内部依赖"
+type = "forbidden"
+source_modules = ["netsentinel.contracts"]
+forbidden_modules = [
+    "netsentinel.agent",
+    "netsentinel.batchflow",
+    "netsentinel.cli",
+    "netsentinel.config",
+    "netsentinel.crawler",
+    "netsentinel.decision",
+    "netsentinel.discovery",
+    "netsentinel.evidence",
+    "netsentinel.finishflow",
+    "netsentinel.golive",
+    "netsentinel.intel",
+    "netsentinel.logging_util",
+    "netsentinel.mathx",
+    "netsentinel.modelmgr",
+    "netsentinel.notify",
+    "netsentinel.ops",
+    "netsentinel.pipeline",
+    "netsentinel.policy",
+    "netsentinel.report",
+    "netsentinel.security",
+    "netsentinel.service",
+    "netsentinel.setup",
+    "netsentinel.storage",
+    "netsentinel.submit",
+    "netsentinel.telemetry",
+    "netsentinel.telemetry_export",
+    "netsentinel.telemetry_trace",
+    "netsentinel.vision",
+]
+
+# 数值微库零内部依赖(红线 29 纯函数内核):mathx 只许依赖 stdlib
+# 与可选 numpy(fast extra),永不反向依赖业务模块。
+[[tool.importlinter.contracts]]
+name = "mathx 数值内核零内部依赖"
+type = "forbidden"
+source_modules = ["netsentinel.mathx"]
+forbidden_modules = [
+    "netsentinel.agent",
+    "netsentinel.batchflow",
+    "netsentinel.cli",
+    "netsentinel.config",
+    "netsentinel.contracts",
+    "netsentinel.crawler",
+    "netsentinel.decision",
+    "netsentinel.discovery",
+    "netsentinel.evidence",
+    "netsentinel.finishflow",
+    "netsentinel.golive",
+    "netsentinel.intel",
+    "netsentinel.logging_util",
+    "netsentinel.modelmgr",
+    "netsentinel.notify",
+    "netsentinel.ops",
+    "netsentinel.pipeline",
+    "netsentinel.policy",
+    "netsentinel.report",
+    "netsentinel.security",
+    "netsentinel.service",
+    "netsentinel.setup",
+    "netsentinel.storage",
+    "netsentinel.submit",
+    "netsentinel.telemetry",
+    "netsentinel.telemetry_export",
+    "netsentinel.telemetry_trace",
+    "netsentinel.vision",
+]
+
+# 结案代理是"被编排方"(红线 36 无自主提交权):agent 只依赖契约基座,
+# 不得反向依赖提交流水 / 判决 / 视觉 / 抓取等业务层。
+[[tool.importlinter.contracts]]
+name = "agent 不上溯业务流水线"
+type = "forbidden"
+source_modules = ["netsentinel.agent"]
+forbidden_modules = [
+    "netsentinel.cli",
+    "netsentinel.submit",
+    "netsentinel.decision",
+    "netsentinel.vision",
+    "netsentinel.crawler",
+    "netsentinel.intel",
+    "netsentinel.config",
+    "netsentinel.mathx",
+    "netsentinel.ops",
+    "netsentinel.pipeline",
+    "netsentinel.security",
+]

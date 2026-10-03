@@ -1,0 +1,107 @@
+# =====================================================================
+# NetSentinel 门户定义:全国"扫黄打非"工作小组办公室(扫黄打非网)[A53]
+#
+# 声明式接入:新门户只需在 portals/ 下新增一份本格式 YAML,再用
+#   load_portal_def("<key>") + build_plan_from_def(...) 生成标准步骤计划,
+#   无需再写 Python planner(v1 的 portal_shdf.py planner 保留,产出与
+#   本定义语义一致,见 tests/test_portal_defs.py 的一致性用例)。
+#
+# 可用键(其余一律拒绝加载;本文件当前只使用以下五个):
+#   name:          门户展示名(必填;进入计划首步 meta["portal"])
+#   entry_url_key: Config 上承载入口地址的字段名(必填;必须是
+#                  netsentinel.contracts.Config 的现有字段)
+#   category:      举报类目文案(必填;生成计划时覆盖 payload.category,
+#                  并同步"选择信息类型"步骤的 value)
+#   selectors:     可选;缺省即契约 §3 的全部选择器(V10.2 含
+#                  email/id/address/postcode/org),如需覆盖必须提供
+#                  form_models.SELECTORS 定义的全部键。
+#                  值支持两种语法(schema v2):
+#                  - v1 单值字符串:"#report-url"(归一化为单元素链);
+#                  - v2 有序候选链(列表):第 1 个候选必须 css(id)打头,
+#                    其后可跟 role+name / label / placeholder / text 兜底候选,
+#                    门户改版换 id 时由 aria/label 候选自动回退(self-healing)。
+#   note:          中文备注(可选)
+#
+# 安全红线:
+#   - 本文件【不允许】写真实门户地址:入口 URL 只能来自
+#     cfg.portal_shdf_base 或调用方显式传参(entry_url_key 只写字段名);
+#   - 验证码选择器只允许 captcha 键使用,任何自动填写/选择/点击触碰它
+#     都会在加载期或计划自检期被拒绝;该拒绝对候选链**逐候选生效**——
+#     任何字段的任何候选以任何形式指向验证码字段(css 同值 / label、
+#     placeholder、text、name 与 captcha 声明值相同或含"验证码"字样)
+#     一律拒绝加载;
+#   - 候选链胜者只进运行时缓存 + 审计 notes,本文件不会被回写。
+#
+# v2 候选链形态示例(当前 selectors 块即此形态;aria/label 文案与
+# 契约字段标签一致,id 打头 + aria/label 兜底):
+#   selectors:
+#     url:
+#       - css: "#report-url"
+#       - role: textbox
+#         name: "举报链接"
+#       - label: "举报链接"
+# =====================================================================
+name: 全国'扫黄打非'工作小组办公室(扫黄打非网)
+entry_url_key: portal_shdf_base
+category: 淫秽色情类
+note: 类目值与选择器沿用 v1 调研结论(docs/portal_shdf_notes.md,门户分类体系以"淫秽色情类"指代色情内容);上线前须人工核验真实入口与字段,门户改版后同步更新本文件。V13 起选择器升级为 v2 候选链(id 打头 + aria/label 兜底),门户小改版可自动回退命中,改版后仍须人工核验并同步本文件。
+selectors:
+  url:
+    - css: "#report-url"
+    - role: textbox
+      name: "举报链接"
+    - label: "举报链接"
+  type:
+    - css: "#report-type"
+    - role: combobox
+      name: "举报类型"
+    - label: "举报类型"
+  desc:
+    - css: "#report-desc"
+    - role: textbox
+      name: "具体描述"
+    - label: "具体描述"
+  name:
+    - css: "#report-name"
+    - role: textbox
+      name: "举报人姓名"
+    - label: "举报人姓名"
+  phone:
+    - css: "#report-phone"
+    - role: textbox
+      name: "联系电话"
+    - label: "联系电话"
+  email:
+    - css: "#report-email"
+    - role: textbox
+      name: "电子邮箱"
+    - label: "电子邮箱"
+  id:
+    - css: "#report-idcard"
+    - role: textbox
+      name: "身份证号"
+    - label: "身份证号"
+  address:
+    - css: "#report-address"
+    - role: textbox
+      name: "通讯地址"
+    - label: "通讯地址"
+  postcode:
+    - css: "#report-postcode"
+    - role: textbox
+      name: "邮政编码"
+    - label: "邮政编码"
+  org:
+    - css: "#report-org"
+    - role: textbox
+      name: "单位名称"
+    - label: "单位名称"
+  file:
+    - css: "#report-file"
+  captcha:
+    - css: "#report-captcha"
+  submit:
+    - css: "#report-submit"
+    - role: button
+      name: "提交举报"
+    - text: "提交举报"

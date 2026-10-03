@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地模拟页面——扫黄打非举报表单模拟(非官方)</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #f4f5f7;
+    color: #222;
+    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  }
+  .banner {
+    background: #fff2f0;
+    border-bottom: 3px solid #d93026;
+    color: #d93026;
+    font-weight: bold;
+    font-size: 18px;
+    text-align: center;
+    padding: 14px 12px;
+    letter-spacing: 1px;
+  }
+  .wrap {
+    max-width: 720px;
+    margin: 24px auto;
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  .sub { color: #666; font-size: 13px; margin: 0 0 18px; }
+  label { display: block; margin: 14px 0 4px; font-size: 14px; }
+  .req { color: #d93026; }
+  input[type="text"], select, textarea {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+  textarea { min-height: 96px; resize: vertical; }
+  #report-captcha { background: #f0f0f0; cursor: not-allowed; }
+  .hint { color: #888; font-size: 12px; margin-top: 4px; }
+  #report-submit {
+    margin-top: 20px;
+    width: 100%;
+    padding: 10px;
+    background: #d93026;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 16px;
+    cursor: pointer;
+  }
+  #report-submit:hover { background: #b3271f; }
+  #ok {
+    display: none;
+    margin-top: 16px;
+    padding: 12px;
+    background: #e8f5e9;
+    border: 1px solid #4caf50;
+    color: #2e7d32;
+    border-radius: 4px;
+    text-align: center;
+    font-weight: bold;
+  }
+  #err {
+    display: none;
+    margin-top: 16px;
+    padding: 12px;
+    background: #fff2f0;
+    border: 1px solid #d93026;
+    color: #d93026;
+    border-radius: 4px;
+    text-align: center;
+    font-weight: bold;
+  }
+  footer { text-align: center; color: #999; font-size: 12px; margin: 18px 0 30px; }
+</style>
+</head>
+<body>
+  <div class="banner">本地模拟页面——非官方网站(扫黄打非举报表单模拟)</div>
+  <div class="wrap">
+    <h1>违法和不良信息举报(模拟表单)</h1>
+    <p class="sub">本页面是 NetSentinel 开发期的本地模拟门户,仅用于 127.0.0.1 离线测试;
+      点击提交不会向任何真实站点发送数据。</p>
+    <form id="report-form" onsubmit="return false;">
+      <label for="report-url">举报链接(<span class="req">*</span>)</label>
+      <input type="text" id="report-url" name="url" placeholder="要举报的站点链接">
+
+      <label for="report-type">举报类型(<span class="req">*</span>)</label>
+      <select id="report-type" name="type">
+        <option value="">-- 请选择举报类型 --</option>
+        <option value="淫秽色情类">淫秽色情类</option>
+        <option value="淫秽色情类">淫秽色情类</option>
+        <option value="网络赌博类">网络赌博类</option>
+        <option value="网络诈骗类">网络诈骗类</option>
+        <option value="侵权假冒类">侵权假冒类</option>
+      </select>
+
+      <label for="report-desc">具体描述(<span class="req">*</span>)</label>
+      <textarea id="report-desc" name="desc"
+        placeholder="请描述违法事实、涉及页面与证据情况(不少于 30 字)"></textarea>
+
+      <label for="report-name">举报人姓名</label>
+      <input type="text" id="report-name" name="name" placeholder="选填">
+
+      <label for="report-phone">联系电话</label>
+      <input type="text" id="report-phone" name="phone" placeholder="选填">
+
+      <label for="report-email">电子邮箱</label>
+      <input type="text" id="report-email" name="email" placeholder="选填">
+
+      <label for="report-idcard">身份证号</label>
+      <input type="text" id="report-idcard" name="idcard" placeholder="选填">
+
+      <label for="report-address">通讯地址</label>
+      <input type="text" id="report-address" name="address" placeholder="选填">
+
+      <label for="report-postcode">邮政编码</label>
+      <input type="text" id="report-postcode" name="postcode" placeholder="选填">
+
+      <label for="report-org">单位名称</label>
+      <input type="text" id="report-org" name="org" placeholder="选填">
+
+      <label for="report-file">附件(证据包 zip,由人工在人工门阶段上传)</label>
+      <input type="file" id="report-file" name="file" accept=".zip,.rar,.7z,.jpg,.jpeg,.png">
+
+      <label for="report-captcha">验证码(仅限人工输入)</label>
+      <input type="text" id="report-captcha" name="captcha"
+        placeholder="验证码:仅供人工输入(模拟站任意4位,光标已自动聚焦)">
+      <p class="hint">安全红线:自动化程序不得识别或填写验证码;光标会自动聚焦到此框,你直接打字即可。</p>
+
+      <button type="button" id="report-submit">提交举报(模拟)</button>
+    </form>
+    <div id="ok">举报已受理(本地模拟)</div>
+    <div id="err">请完整填写</div>
+  </div>
+  <footer>NetSentinel 本地模拟门户 · 仅限 127.0.0.1 离线开发测试使用</footer>
+<script>
+(function () {
+  "use strict";
+  function val(id) {
+    var el = document.getElementById(id);
+    return el ? String(el.value || "").trim() : "";
+  }
+  document.getElementById("report-submit").addEventListener("click", function () {
+    var okBox = document.getElementById("ok");
+    var errBox = document.getElementById("err");
+    okBox.style.display = "none";
+    errBox.style.display = "none";
+    if (val("report-url") && val("report-desc")) {
+      okBox.style.display = "block";
+    } else {
+      errBox.style.display = "block";
+    }
+  });
+})();
+</script>
+</body>
+</html>
