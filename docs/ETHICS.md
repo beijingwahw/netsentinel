@@ -47,8 +47,9 @@ NetSentinel 的全部自动化仅完成"抽样、识别、填表"等辅助环节
 
 这是本项目的第一条技术红线,内建于计划生成与执行器,不可绕过:
 
-- 举报计划(`SubmissionPlan`)中**不存在任何自动识别、自动填写或绕过验证码的步骤**;验证码环节只能是 `HUMAN_GATE`;
-- `HUMAN_GATE` 处操作员须:核对已填信息 → 上传证据包 zip(`#report-file`,v1 不自动上传)→ 人工输入验证码(`#report-captcha`)→ 确认后系统才点击提交按钮(`#report-submit`);
+- 举报计划(`SubmissionPlan`)中**不存在任何自动识别、自动填写或绕过验证码的步骤**;验证码环节只能是 `HUMAN_GATE`(其前一步为 `FOCUS` 半自动焦点:仅把光标聚焦到验证码输入框,不填写任何内容);
+- **证据截图自动上传(V10.16)**:真实执行时,执行器在 `HUMAN_GATE` **之前**自动把证据截图上传到附件口 `#report-file`——每个证据包预先从 manifest 的 ensemble 评分中选出 **Top-10** 证据截图(nsfw_prob 降序、不足用整页截图补足,清单落 `evidence_pool.json` 留痕),再按门户配额切片:12377 十张、扫黄打非(shdf)五张。上传是**辅助动作**:任何失败(无池/无文件节点/异常)只记提示并降级为人工门手动上传,绝不中断举报;
+- `HUMAN_GATE` 处操作员须:**核对已自动上传的附件与已填信息**(信息类型、举报链接、描述、个人信息等;附件不齐时可手动补传)→ 人工输入验证码(`#report-captcha`)→ 确认后系统才点击提交按钮(`#report-submit`)。**验证码的识别与输入、最终提交的确认,永远属于人工**;
 - `auto_confirm=True` 仅限本地 mock 测试,标注"自动确认(测试)",**严禁用于真实门户**;
 - 开发与测试期间**绝不访问** www.12377.cn / www.shdf.gov.cn 真实站点,只用本地 mock 或 dry_run。
 
@@ -69,7 +70,8 @@ NetSentinel 的全部自动化仅完成"抽样、识别、填表"等辅助环节
 | 禁网默认 | `allow_network` | `false`(仅放行 127.0.0.1/localhost) |
 | 默认干跑 | `dry_run_default` | `true`(不真正驱动浏览器提交) |
 | 提交频控 | `submit_min_interval_s` / `submit_max_per_day` | 60s / 每日 5 次(强制生效) |
-| 验证码人工 | `StepAction.HUMAN_GATE` + `SELECTORS["captcha"]` | 计划中无任何自动处理验证码的步骤 |
+| 验证码人工 | `StepAction.FOCUS` + `StepAction.HUMAN_GATE` + `SELECTORS["captcha"]` | 计划中无任何自动处理验证码的步骤;FOCUS 仅聚焦不填写 |
+| 证据自动上传 | `submit/evidence_pool.py`(Top-10 池)+ 门户配额 | 12377 十张 / shdf 五张,人工门前辅助动作,失败降级人工 |
 | 礼貌抓取 | `respect_robots` / `fetch_delay_s` / UA | `true` / 1s / `NetSentinel/0.1` |
 
 相关文档:[USAGE.md](USAGE.md)、[ARCHITECTURE.md](ARCHITECTURE.md)、[../CONTRACTS.md](../CONTRACTS.md)(契约 §0 安全红线原文)。

@@ -713,7 +713,11 @@ class TimestampProver:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(payload)
-                os.replace(tmp_name, self.counter_path)  # 原子替换,不留半截文件
+                # V10.12:Windows 目标被短暂占用(并发进程/杀毒扫描)时
+                # 有限重试;成功路径与裸 os.replace 逐字节一致。
+                from netsentinel.atomic import replace_with_retry  # 惰性:兄弟微工具
+
+                replace_with_retry(tmp_name, self.counter_path)  # 原子替换,不留半截文件
             except BaseException:
                 try:
                     os.unlink(tmp_name)

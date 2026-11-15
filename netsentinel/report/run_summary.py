@@ -5,8 +5,10 @@
 运行战况渲染成**收官汇总报告**(Markdown + HTML 双件套),供运营者核对、
 归档。与 ``report.html_report``(单站举报材料)、``report.batch_report``
 (批量结案报告)同属公文风格,但**独立实现、互不依赖**;本模块只用
-Python 标准库(html / os / datetime / pathlib),产物为零外部依赖的
-离线文件(HTML 内联 CSS)。
+Python 标准库(html / os / pathlib)与基座级时间源
+:mod:`netsentinel.timesource`(V10.21 席位2 时间源单源化,生成时间
+strftime 改经 ``timesource.now_local()``,墙钟输出与原 naive
+``datetime.now()`` 逐字节等价),产物为零外部依赖的离线文件(HTML 内联 CSS)。
 
 核心入口 :func:`render_run_summary`:
 
@@ -50,9 +52,10 @@ import html as _html
 import logging
 import os
 from collections.abc import Mapping
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from netsentinel import timesource
 
 __all__ = ["CONCLUSION", "HIGH_TIER_NOTE", "VERDICT_CN", "render_run_summary"]
 
@@ -252,7 +255,7 @@ def render_run_summary(stats: dict[str, Any], out_base: str) -> tuple[str, str]:
     )
     errors, error_total = _error_rows(_field(stats, "errors", []))
     generated_at = str(
-        _field(stats, "generated_at") or datetime.now().strftime(_TS_FORMAT)
+        _field(stats, "generated_at") or timesource.now_local().strftime(_TS_FORMAT)
     )
     high_note = tier.lower() == "high"
 

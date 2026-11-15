@@ -171,10 +171,10 @@ def accept_key_input(provider: str, key: str, *, base: str | None = None) -> dic
 def masked(provider: str) -> str | None:
     """返回提供方已配置密钥的掩码(前 4 位 + ``****``);未配置返回 ``None``。
 
-    经 :func:`security.keys.get_key` 三来源解析(配置项 → 环境变量 →
-    密钥文件,默认 ``Config()`` 无配置项);纯本地读,绝不联网、绝不
-    返回密钥本体(红线 33)。提供方名非法 / 非字符串时 ``get_key``
-    按未配置处理,本函数返回 ``None``。
+    经 :func:`security.keys.get_key` 四来源解析(配置 → 环境变量 →
+    OS keyring → 密钥文件,默认 ``Config()`` 无配置项);纯本地读,
+    绝不联网、绝不返回密钥本体(红线 33)。提供方名非法 / 非字符串时
+    ``get_key`` 按未配置处理,本函数返回 ``None``。
     """
     name = provider.strip() if isinstance(provider, str) else ""
     value = keys.get_key(name, Config())

@@ -658,6 +658,11 @@ def pyramid_distance(a: str, b: str) -> int:
     是随机异图的期望距离从 54/108 降到约 27+ ,工作距
     :data:`PYRAMID_SUGGESTED_MAX_DISTANCE`(11)按实测异图最小距 12
     留零误报上沿校准,不要放大使用。
+
+    双实现互锁(刻意不合并):``netsentinel/intel/phash.py`` 的
+    ``_pyramid_distance_hex`` 为本函数的 intel 侧镜像实现(intel 层不得
+    上溯依赖 vision 层,故各自持有);修改此处须同步该镜像,两处由
+    ``tests/test_phash_invariant.py`` 的一致性用例互相锁定。
     """
     ha = _normalize_hex(a, "金字塔哈希 a")
     hb = _normalize_hex(b, "金字塔哈希 b")
@@ -890,9 +895,12 @@ def tile_any_match(a: str, b: str) -> int:
         )
     tiles_a = [ha[i * _TILE_SEG_HEX:(i + 1) * _TILE_SEG_HEX] for i in range(_TILE_COUNT)]
     tiles_b = [hb[i * _TILE_SEG_HEX:(i + 1) * _TILE_SEG_HEX] for i in range(_TILE_COUNT)]
-    return min(
-        hamming_hex(ta, tb) for ta in tiles_a for tb in tiles_b
-    )
+    # V10.12:每侧 tile 先一次性 int(x,16)(共 24 次),循环体内只做
+    # xor + bit_count——原先 144 对比较各调 hamming_hex,重复 288 次
+    # 字符串规范化;两口径等价(同长十六进制,汉明距 = popcount(a^b))。
+    ints_a = [int(t, 16) for t in tiles_a]
+    ints_b = [int(t, 16) for t in tiles_b]
+    return min((ta ^ tb).bit_count() for ta in ints_a for tb in ints_b)
 
 
 # ---------------------------------------------------------------------------

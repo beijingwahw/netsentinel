@@ -56,12 +56,12 @@ from pathlib import Path
 from netsentinel import telemetry
 from netsentinel.contracts import SiteReport, now_iso
 from netsentinel.decision.review_queue import (
-    BUSY_TIMEOUT_MS,
     STATUS_CN,
     Entry,
     ReviewQueue,
 )
 from netsentinel.storage.event_log import EventLog
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 logger = logging.getLogger(__name__)
 
@@ -129,11 +129,10 @@ class FourEyesQueue:
         # A222 透传:账本经底层 A213 双写机制落 entry_* 事件(先账本后状态)。
         self._queue = ReviewQueue(self.db_path, event_log=event_log)
         # 自有连接只管 approvals 表(即时 commit,与底层写纪律一致)。
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = sqlite_connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        # V5:与底层 ReviewQueue(A10)同一连接策略:WAL + 忙等 5s。
-        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # V10.21:连接统一经 storage.kernel.connect 工厂(全仓唯一
+        # sqlite3.connect 入口);WAL + 忙等 5s 由工厂内置,口径不变。
         self._conn.execute(_APPROVALS_SQL)
         self._conn.commit()
         logger.debug(

@@ -334,6 +334,7 @@ class Config:
     yandex_xml_user: str = ""                 # 缺省读环境变量 NETSENTINEL_YANDEX_USER
     yandex_xml_key: str = ""                  # 缺省读环境变量 NETSENTINEL_YANDEX_KEY
     searxng_base_url: str = "http://127.0.0.1:8888"  # 自托管 SearXNG 实例
+    yandex_html_base: str = ""                # yandex-html 网页检索端点(""=内置默认 https://yandex.com/search/)
 
     # ---- V7:内核进化(全部默认关/兼容,旧调用方零感知) ----
     use_sprt: bool = False                # 决策内核:序贯检验早停(省 VLM 预算)
@@ -399,3 +400,26 @@ class Config:
     # ---- V14:接线残余批配置收录(A223 附加属性升格;默认值精确保持收录前行为) ----
     bayes_reliability: bool = False          # A223 贝叶斯可靠性权重回流开关(默认关 = 现状等权;开启时优先于 ensemble_reliability_weights)
     bayes_half_life: float | None = None     # A223 贝叶斯遗忘半衰期,单位天(None = 关闭遗忘 = 现状;正值 = 漂移感知,与 reliability.jsonl ts 字段的 epoch 秒量纲对齐,orchestrator 构造 tracker 时换算)
+
+    # ---- V10.29(P0-2):受界并发送审(默认值精确保持并发前行为的可回退口) ----
+    vlm_parallel_workers: int = 0            # 送审并发:0=自动档 min(档位 io_workers,6);1=强制串行(逐字节旧行为);2~16 显式(>16 钳到 16)
+    provider_rpm: int = 0                    # 每提供方礼貌限速(A74 令牌桶 RPM;0=不限速——并发下建议按提供方配额设置)
+
+    # ---- V10.30(P1-5):VLM 扫描预检(爬取之前拦系统性故障,防"爬完才全灭"空烧) ----
+    vlm_budget_precheck: bool = True         # 预检总开关(计量检测+健康账本+本地预算;False=逐字节旧行为)
+    vlm_health_ttl_s: int = 300              # 健康账本 TTL:评分系统性失败后,同成员站点在该秒数内预检直接跳过
+
+    # ---- V10.31(P1-3):站内爬取/推理流水线重叠(仅默认链路;判定语义与串行一致) ----
+    scan_pipeline_overlap: bool = True       # 主线程逐页礼貌爬取 + 后台按页分块并发评分;False=串行逐字节旧行为
+
+    # ---- V10.32(P1-4):同站近重复拦下(phash 先于 VLM;仅同站生效,fail-open) ----
+    vlm_neardup_dedup: bool = True           # 送审前 phash 近重复比对;False=关闭(逐字节旧行为)
+    vlm_neardup_threshold_bits: int = 4      # 汉明距阈值(64bit;0=仅完全同指纹;>4 放宽需自担误合并)
+
+    # ---- V10.35(P2-7/8/9):无人值守韧性(优雅退出/遥测落盘/告警重试/断点续跑) ----
+    graceful_exit_enabled: bool = True       # 批量扫描链路 Ctrl+C/SIGTERM:停接新站→排空在飞→中文摘要退出
+    telemetry_jsonl_path: str = ""           # 遥测快照落盘路径(空=不落盘;批末/服务关闭各追加一行 JSON)
+    notify_retry_max: int = 0                # 通知有界重试次数(0=单发不重试=V2 缺省红线;>0=指数退避只重发通知)
+    notify_retry_backoff_s: float = 5.0      # 通知重试基础退避秒(每次翻倍;仅 notify_retry_max>0 时生效)
+    scan_journal_enabled: bool = True        # 站级扫描日志(SQLite):崩溃后 --resume-scan 跳过已完成站
+    scan_journal_db: str = ""                # 扫描日志库路径(空=<data_dir>/scan_journal.db)

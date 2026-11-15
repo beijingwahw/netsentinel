@@ -2,6 +2,9 @@
 
 - 纯逻辑层(verdict_cn / build_entry_card / filter_entries / safe_image_paths /
   apply_data_dir / load_report_dict)不依赖 streamlit,未装 UI 依赖也能跑;
+- A233 门户动态化:portal_choices(清单/回退/动态发现)与 build_portal_plan
+  (与 v1 planner 语义等价、动态门户、未知/未启用拒绝)同样纯逻辑可测;
+- 标签口径统一:四页共享 webui/_labels.py 同一字典对象;
 - UI 部分用 pytest.importorskip("streamlit") 保护,缺依赖自动跳过;
 - 只写 tmp_path,不联网、不访问真实门户、不启动 streamlit 服务。
 """
@@ -15,10 +18,13 @@ import pytest
 
 from webui.app import (
     MAX_EXPLAIN_LINES,
+    VERDICT_CN_MAP,
     apply_data_dir,
     build_entry_card,
+    build_portal_plan,
     filter_entries,
     load_report_dict,
+    portal_choices,
     safe_image_paths,
     verdict_cn,
 )
@@ -36,10 +42,10 @@ _MB = 1024 * 1024
 @pytest.mark.parametrize(
     ("raw", "expect"),
     [
-        ("clean", "未发现"),
+        ("clean", "未见违规"),
         ("suspect", "疑似"),
         ("nsfw", "高置信"),
-        (Verdict.CLEAN, "未发现"),
+        (Verdict.CLEAN, "未见违规"),
         (Verdict.SUSPECT, "疑似"),
         (Verdict.NSFW, "高置信"),
         ("weird", "未知"),
@@ -119,7 +125,7 @@ def test_build_entry_card_explain_capped_at_six():
 def test_build_entry_card_without_report():
     entry = Entry(id=3, site_url="https://y.com", verdict="clean", status="rejected")
     card = build_entry_card(entry, None)
-    assert card["verdict_cn"] == "未发现"
+    assert card["verdict_cn"] == "未见违规"
     assert card["agg"] == 0.0
     assert card["intel"] == {}
     assert card["explain_lines"] == []
@@ -387,3 +393,149 @@ def test_v5_build_entry_card_counts_telemetry():
     build_entry_card({"id": 2, "site_url": "https://t.com", "verdict": "clean"}, {})
     counters = telemetry.snapshot()["counters"]
     assert counters.get("webui.card_built") == 2.0  # 每次成功组装 +1(含空报告)
+
+
+# ---------------------------------------------------------------------------
+# A233 门户动态化:portal_choices / build_portal_plan(纯逻辑层)
+# ---------------------------------------------------------------------------
+def test_portal_choices_includes_builtin_portals():
+    """缺省清单:内置 12377/shdf 在列,展示名非空,无告警。"""
+    choices, warning = portal_choices()
+    assert {"12377", "shdf"} <= set(choices)
+    assert all(str(v).strip() for v in choices.values())
+    assert warning == ""
+
+
+def test_portal_choices_fallback_when_portal_defs_broken(monkeypatch):
+    """portal_defs 不可用 → 回退内置 12377/shdf + 中文告警,绝不抛错。"""
+    from netsentinel.submit import portal_defs
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("门户模块损坏(测试注入)")
+
+    monkeypatch.setattr(portal_defs, "list_portals", _boom)
+    choices, warning = portal_choices()
+    assert set(choices) == {"12377", "shdf"}
+    assert "回退" in warning
+
+    # 清单为空同样回退(不抛错)
+    monkeypatch.setattr(portal_defs, "list_portals", lambda *a, **k: {})
+    choices, warning = portal_choices()
+    assert set(choices) == {"12377", "shdf"}
+    assert "回退" in warning
+
+
+def test_portal_choices_discovers_dynamic_enabled_portal(tmp_path, monkeypatch):
+    """动态门户(enabled: true)进入清单;enabled 缺省/为 false 不进。"""
+    from netsentinel.submit import portal_defs
+
+    (tmp_path / "dyn.yaml").write_text(
+        "name: 动态测试门户\n"
+        "entry_url_key: portal_12377_base\n"
+        "category: 测试类目\n"
+        "enabled: true\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "off.yaml").write_text(
+        "name: 未启用门户\n"
+        "entry_url_key: portal_12377_base\n"
+        "category: 测试类目\n"
+        "enabled: false\n",
+        encoding="utf-8",
+    )
+    real_list = portal_defs.list_portals
+    monkeypatch.setattr(
+        portal_defs, "list_portals",
+        lambda include_disabled=False, directory=None: real_list(
+            include_disabled, str(tmp_path)
+        ),
+    )
+    choices, warning = portal_choices()
+    assert warning == ""
+    assert "dyn" in choices and choices["dyn"] == "动态测试门户"
+    assert "off" not in choices  # 红线:未显式 enabled:true 的动态门户不进清单
+    assert {"12377", "shdf"} <= set(choices)
+
+
+def test_build_portal_plan_agrees_with_v1_planners():
+    """A233:与 v1 plan_12377/plan_shdf 产出语义等价(步序/标签/类目/首步 meta)。"""
+    from netsentinel.contracts import Config
+    from netsentinel.submit.portal_12377 import plan_12377
+    from netsentinel.submit.portal_shdf import plan_shdf
+
+    cfg = Config(
+        portal_12377_base="http://127.0.0.1:8900/",
+        portal_shdf_base="http://127.0.0.1:8901/",
+    )
+    entry = Entry(id=1, site_url="https://bad.example.com/x", verdict="nsfw")
+    for portal, v1 in (("12377", plan_12377), ("shdf", plan_shdf)):
+        ours = build_portal_plan(entry, portal, cfg)
+        theirs = v1(entry, cfg)
+        assert [s.action for s in ours.steps] == [s.action for s in theirs.steps]
+        assert [s.label for s in ours.steps] == [s.label for s in theirs.steps]
+        assert ours.payload.category == theirs.payload.category
+        assert ours.entry_url == theirs.entry_url
+        assert ours.steps[0].meta["portal"] == theirs.steps[0].meta["portal"]
+        assert str(ours.portal) == str(theirs.portal)
+
+
+def test_build_portal_plan_rejects_unknown_portal():
+    """未知门户 → ValueError 中文(动态与内置清单皆无该短名)。"""
+    from netsentinel.contracts import Config
+
+    with pytest.raises(ValueError, match="未知的门户标识"):
+        build_portal_plan(Entry(id=1, site_url="https://x.com", verdict="nsfw"), "nope", Config())
+
+
+def test_build_portal_plan_supports_dynamic_portal(tmp_path, monkeypatch):
+    """动态门户经 get_portal(显式 enabled:true)可生成计划;未启用的被拒绝。"""
+    from netsentinel.contracts import Config
+    from netsentinel.submit import portal_defs
+
+    (tmp_path / "dyn.yaml").write_text(
+        "name: 动态测试门户\n"
+        "entry_url_key: portal_12377_base\n"
+        "category: 动态类目\n"
+        "enabled: true\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "off.yaml").write_text(
+        "name: 未启用门户\n"
+        "entry_url_key: portal_12377_base\n"
+        "category: 动态类目\n"
+        "enabled: false\n",
+        encoding="utf-8",
+    )
+    real_get = portal_defs.get_portal
+    monkeypatch.setattr(
+        portal_defs, "get_portal",
+        lambda name, directory=None: real_get(name, str(tmp_path)),
+    )
+    cfg = Config(portal_12377_base="http://127.0.0.1:8900/")
+    entry = Entry(id=1, site_url="https://bad.example.com/x", verdict="nsfw")
+
+    plan = build_portal_plan(entry, "dyn", cfg)
+    assert plan.entry_url == "http://127.0.0.1:8900/"
+    assert plan.payload.category == "动态类目"
+    assert plan.steps[0].meta["portal"] == "动态测试门户"
+    assert any(s.action.value == "human_gate" for s in plan.steps)
+
+    with pytest.raises(ValueError, match="尚未启用"):
+        build_portal_plan(entry, "off", cfg)
+
+
+def test_labels_single_authority_shared_by_pages():
+    """标签口径统一:app/groups/runs/dashboard 四页与 _labels 同一字典对象。"""
+    import webui._labels as labels
+    import webui.dashboard as dashboard
+    import webui.groups_page as groups_page
+    import webui.runs_page as runs_page
+
+    assert labels.VERDICT_CN == {"clean": "未见违规", "suspect": "疑似", "nsfw": "高置信"}
+    assert labels.STATUS_CN == {
+        "pending": "待复核", "approved": "已批准", "rejected": "已驳回", "submitted": "已提交",
+    }
+    assert VERDICT_CN_MAP is labels.VERDICT_CN
+    assert groups_page.VERDICT_CN is labels.VERDICT_CN
+    assert runs_page.VERDICT_LABELS_CN is labels.VERDICT_CN
+    assert dashboard._STATUS_CN is labels.STATUS_CN

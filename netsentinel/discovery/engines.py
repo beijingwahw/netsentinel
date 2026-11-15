@@ -69,13 +69,13 @@ def register_engine(name: str, cls: type[SearchEngine]) -> None:
 
 
 def list_engines() -> list[str]:
-    """可用引擎名(含惰性内置三家)。"""
-    builtin = {"yandex", "searxng", "mock"}
+    """可用引擎名(含惰性内置四家)。"""
+    builtin = {"yandex", "yandex-html", "searxng", "mock"}
     return sorted(set(_REGISTRY) | builtin)
 
 
 def get_engine(name: str, cfg: Config, **kwargs: Any) -> SearchEngine:
-    """按名构造引擎;yandex/searxng/mock 缺省惰性导入,未知名中文报错。"""
+    """按名构造引擎;yandex/yandex-html/searxng/mock 缺省惰性导入,未知名中文报错。"""
     key = (name or "").strip().lower()
     if key == "mock":
         from netsentinel.discovery.engines import MockEngine as _M
@@ -85,6 +85,10 @@ def get_engine(name: str, cfg: Config, **kwargs: Any) -> SearchEngine:
         from netsentinel.discovery.yandex import YandexXmlEngine
 
         return YandexXmlEngine(cfg, **kwargs)
+    if key in ("yandex-html", "yandex_html", "yandexhtml"):
+        from netsentinel.discovery.yandex_html import YandexHtmlEngine
+
+        return YandexHtmlEngine(cfg, **kwargs)
     if key == "searxng":
         from netsentinel.discovery.searxng import SearxngEngine
 

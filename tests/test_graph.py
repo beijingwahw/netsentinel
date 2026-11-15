@@ -982,3 +982,49 @@ def test_v5_link_batched_write_matches_reference(tmp_path: Any) -> None:
             if e["kind"] == EDGE_SHARED_IMAGE
         }
         assert new_edges == ref_edges
+
+
+# ---------------------------------------------------------------------------
+# V10.18 全量折叠恒等式等价:权重 == 暴力 set 并集参照
+# ---------------------------------------------------------------------------
+def test_link_full_mode_weights_match_bruteforce_union(tmp_path: Any) -> None:
+    """等价性:全量 link 的权重分母经恒等式 |a|+|b|−|a∩b| 计算,
+    与「逐对物化 set 并集再取 len」的旧式暴力参照逐对全等(含 1.0 /
+    稀疏共享 / 单站独享不建边等形态)。"""
+    import random
+
+    rng = random.Random(20261018)
+    sites = [f"https://s{i}.example.com/" for i in range(6)]
+    hashes = [f"{i:064x}" for i in range(24)]
+    with _graph(tmp_path) as g:
+        for url in sites:
+            g.add_site(url)
+        # 随机重叠:每张图落在 1~4 个站点(单站图参与并集分母、不建边)
+        assignments = []
+        for h in hashes:
+            k = rng.choice((1, 1, 2, 2, 3, 4))
+            chosen = rng.sample(sites, k)
+            assignments.append((h, chosen))
+            for s in chosen:
+                g.add_image(h, s)
+        g.link_shared_images()  # touched_sites=None → 全量路径
+        got = {(s, d): w for s, d, w in _edges_of_kind(g, "shared_image")}
+
+        # 暴力参照:真实物化每站图集合,共享/并集均用 set 运算
+        per_site: dict[str, set[str]] = {s: set() for s in sites}
+        for h, chosen in assignments:
+            for s in chosen:
+                per_site[s].add(h)
+        ref: dict[tuple[str, str], float] = {}
+        for i in range(len(sites)):
+            for j in range(i + 1, len(sites)):
+                a, b = per_site[sites[i]], per_site[sites[j]]
+                shared = a & b
+                if not shared:
+                    continue
+                union = a | b
+                ref[_sites_pair(sites[i], sites[j])] = len(shared) / len(union)
+
+        assert set(got) == set(ref)          # 边集合全等(无多建/漏建)
+        for pair in ref:
+            assert got[pair] == ref[pair]    # 权重逐位全等(整数除法同输入)

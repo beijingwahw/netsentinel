@@ -31,6 +31,7 @@ description 模板单次 format;build_plan 12 步列表字面量一次成型;
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from netsentinel import telemetry
@@ -54,6 +55,9 @@ __all__ = [
     "build_plan",
     "plan_from_entry",
 ]
+
+#: 模块日志器(V10.18:auto_profile 加载失败的 debug 级诊断;不落个人信息)。
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +333,10 @@ def build_payload(
             reporter_name = reporter_name or _profile.name
             reporter_phone = reporter_phone or _profile.phone
         except Exception:  # noqa: BLE001
-            pass
+            # V10.18 静默收窄:加载失败不再无痕,留 debug 级诊断(debug 而非
+            # warning——未配置 profile 属正常形态,不应刷屏);行为零变化,
+            # 仅日志,不落个人信息内容。
+            logger.debug("个人信息模板自动带入失败,按未配置处理", exc_info=True)
 
     description_body = _DESCRIPTION_TEMPLATE.format(
         site_url=site_url,

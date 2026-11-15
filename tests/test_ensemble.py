@@ -273,3 +273,47 @@ def test_v5_weighted_average_after_single_pass_merge() -> None:
     assert result[0].nsfw_prob == pytest.approx((0.9 * 2 + 0.3) / 3)
     # (1.2*2 + 0.8)/3 ≈ 1.0667 → 截断到 1.0
     assert result[1].nsfw_prob == 1.0
+
+
+# ---------------------------------------------------------------------------
+# V10.18:加权和求和顺序确定性(sum → math.fsum,仿 V10.12 fusion 先例)
+# ---------------------------------------------------------------------------
+
+def test_v10_weighted_mean_is_order_independent_at_threshold_boundary() -> None:
+    """成员分输入重排不改变集成结果:加权均值恰在阈值边界(0.5)时逐位一致。
+
+    演示依据(修复前裸 sum 实测抓出):同一组等权成员分
+    0.2/0.65/0.25/0.9,数学均值恰为 0.5——
+
+    - 输入顺序 [0.2, 0.65, 0.25, 0.9]:左结合累加得 0.5,
+      ``agg >= 0.5``(复核线)成立 → SUSPECT;
+    - 输入顺序 [0.9, 0.25, 0.65, 0.2]:累加路径不同得 0.49999999999999994,
+      ``agg >= 0.5`` 不成立 → CLEAN;
+
+    即成员评分到达顺序本身决定判定档位。decision/verdict 对 agg 的
+    ``>=`` 硬比较使这一末位 ulp 分歧直接翻档。math.fsum 正确舍入求和后,
+    任意输入顺序均得精确 0.5,逐位确定。
+    """
+    order_a = [
+        make_score("a.jpg", "m1", 0.2),
+        make_score("a.jpg", "m2", 0.65),
+        make_score("a.jpg", "m3", 0.25),
+        make_score("a.jpg", "m4", 0.9),
+    ]
+    order_b = [  # 同一组成员分,仅到达顺序不同
+        make_score("a.jpg", "m4", 0.9),
+        make_score("a.jpg", "m3", 0.25),
+        make_score("a.jpg", "m2", 0.65),
+        make_score("a.jpg", "m1", 0.2),
+    ]
+
+    result_a = ensemble_scores(order_a)
+    result_b = ensemble_scores(order_b)
+
+    # 任意顺序均得精确 0.5,不落 0.49999999999999994
+    assert result_a[0].nsfw_prob == 0.5
+    assert result_b[0].nsfw_prob == 0.5
+    # 逐位一致(裸 sum 下此处为 !=,两序分歧)
+    assert result_a[0].nsfw_prob == result_b[0].nsfw_prob
+    # 边界判定不再依赖输入顺序
+    assert (result_a[0].nsfw_prob >= 0.5) == (result_b[0].nsfw_prob >= 0.5)

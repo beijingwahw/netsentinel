@@ -36,6 +36,10 @@ from typing import Any
 
 from netsentinel import telemetry
 from netsentinel.contracts import Config, ImageEvidence, ImageScore
+# (V10.18)响应体大小上限复用通用传输层 vlm_client 的实现(专用层→通用层
+# 单向依赖,与"vlm_client 不导入 glm 专用实现"的解耦方向一致,无环)。
+from netsentinel.vision.vlm_client import RESPONSE_MAX_MB as _RESPONSE_MAX_MB
+from netsentinel.vision.vlm_client import _read_capped as _vlm_read_capped
 
 __all__ = ["VlmOfflineError", "GlmVlmClient", "GlmVlmClassifier"]
 
@@ -108,18 +112,26 @@ def _http_post_json(
     - 构造 ``urllib.request.Request``(method=POST,body 为 UTF-8 JSON);
     - ``HTTPError`` 不上抛,捕获后转成 ``(状态码, 错误体文本)`` 返回,由调用方
       按状态码决定回退/报错;
-    - 其余 ``URLError``(网络层错误)原样上抛,由上层按指数退避自动重试。
+    - 其余 ``URLError``(网络层错误)原样上抛,由上层按指数退避自动重试;
+    - (V10.18)响应体读取复用 vlm_client 的 :func:`_read_capped` 大小上限
+      (默认 10MiB):成功响应超限抛中文 RuntimeError,错误体超限截断——
+      与 vlm_client 主传输层同口径,防异常超大响应占内存。
     """
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
+            body, exceeded = _vlm_read_capped(response)
             status = int(getattr(response, "status", 200) or 200)
+            if exceeded:
+                raise RuntimeError(
+                    f"接口响应体超过大小上限,已中止读取:"
+                    f"上限={_RESPONSE_MAX_MB:.2f}MB"
+                )
             return status, body
     except urllib.error.HTTPError as exc:  # HTTP 层错误:转为状态码 + 错误体
         try:
-            body = exc.read().decode("utf-8", errors="replace")
+            body, _ = _vlm_read_capped(exc)
         except Exception:  # noqa: BLE001 - 错误体读取失败不应掩盖状态码
             body = ""
         return int(exc.code), body
@@ -544,6 +556,7 @@ class GlmVlmClassifier(NsfwClassifier):
     """
 
     name = "glm"
+    consumes_vlm_budget = True  # P1-5:评分消耗 VlmCache 日预算(远程 VLM 家族)
 
     def __init__(
         self,

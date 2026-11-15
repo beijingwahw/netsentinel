@@ -147,10 +147,10 @@ def test_fetch_page_success(server: LocalServer) -> None:
 
 
 def test_fetch_page_sends_declared_user_agent(server: LocalServer) -> None:
-    """请求头 User-Agent 必须是契约规定的 NetSentinel/0.1。"""
+    """请求头 User-Agent 必须是契约规定的 NetSentinel/0.17(三处常量统一取值)。"""
     status, html, _ = fetch_page(f"{server.base_url}/echo-ua", make_cfg())
     assert status == 200
-    assert html.strip() == "NetSentinel/0.1"
+    assert html.strip() == "NetSentinel/0.17"
 
 
 def test_fetch_page_404_returns_status_without_raising(server: LocalServer) -> None:
@@ -197,12 +197,17 @@ def test_fetch_page_blocked_for_external_when_network_disabled() -> None:
 # ---------------------------------------------------------------------------
 
 class _DenyAllParser:
-    """替身:任何 URL 都判为 robots 禁止。"""
+    """替身:任何 URL 都判为 robots 禁止。
+
+    实现口径随 fetcher 升级:robots.txt 由 fetcher 侧带超时 urlopen 拉取后
+    经 ``parse(lines)`` 逐行喂入(不再走 ``RobotFileParser.read``),故替身
+    挂 ``parse``;使用本替身的用例须同时打桩 urlopen(见下)。
+    """
 
     def set_url(self, url: str) -> None:
         self.url = url
 
-    def read(self) -> None:
+    def parse(self, lines: list[str]) -> None:
         return None
 
     def can_fetch(self, useragent: str, url: str) -> bool:
@@ -212,6 +217,13 @@ class _DenyAllParser:
 def test_fetch_page_robots_denied_for_real_external(monkeypatch: pytest.MonkeyPatch) -> None:
     """真实外网目标被 robots 禁止时抛 RobotsDeniedError(打桩,无真实请求)。"""
     monkeypatch.setattr(urllib.robotparser, "RobotFileParser", _DenyAllParser)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse(
+            "https://example.com/robots.txt", b"User-agent: *\nDisallow: /"
+        ),
+    )
     with pytest.raises(RobotsDeniedError):
         fetch_page("https://example.com/page", make_cfg(allow_network=True))
 
@@ -459,14 +471,19 @@ def test_v5_fetch_page_connection_refused_not_retried(monkeypatch: pytest.Monkey
 
 
 class _CountingAllowParser:
-    """替身:read 成功、can_fetch 一律允许;按类属性统计真实拉取次数。"""
+    """替身:robots 解析成功、can_fetch 一律允许;按类属性统计真实拉取次数。
+
+    实现口径随 fetcher 升级:robots.txt 由 fetcher 侧带超时 urlopen 拉取后
+    经 ``parse(lines)`` 逐行喂入(不再走 ``RobotFileParser.read``),故计数
+    挂在 ``parse`` 上(一次 parse = 一次真实 robots 拉取)。
+    """
 
     reads = 0
 
     def set_url(self, url: str) -> None:
         self.url = url
 
-    def read(self) -> None:
+    def parse(self, lines: list[str]) -> None:
         type(self).reads += 1
 
     def can_fetch(self, useragent: str, url: str) -> bool:
@@ -506,29 +523,36 @@ def test_v5_robots_cached_per_site_within_ttl(
     assert _CountingAllowParser.reads == 3
 
 
-def test_v5_robots_read_failure_not_cached(
+def test_v5_robots_read_failure_negative_cached(
     monkeypatch: pytest.MonkeyPatch, clean_robots_cache: None
 ) -> None:
-    """robots.txt 拉取失败按"允许"处理且不缓存:下次校验会再次尝试拉取。"""
+    """robots.txt 拉取失败按"允许"处理且写入 TTL 负缓存:TTL 内不再重试。
 
-    class _FlakyRobotsParser(_CountingAllowParser):
-        def read(self) -> None:
-            type(self).reads += 1
-            raise urllib.error.URLError("robots.txt 不可达")
+    行为升级(对齐采集侧深度修复):V5 时代失败不缓存、逐页重试——外网
+    站点 robots 端点挂起/不可达时每页都会再挂一次;现失败同样进缓存
+    (值为 None),TTL 内同站校验直接复用失败结论,TTL 过期才重试。
+    """
 
-    _FlakyRobotsParser.reads = 0
-    monkeypatch.setattr(urllib.robotparser, "RobotFileParser", _FlakyRobotsParser)
-    monkeypatch.setattr(
-        urllib.request,
-        "urlopen",
-        lambda request, timeout: _FakeResponse("http://x/", b"page"),
-    )
+    robots_calls: list[str] = []
+
+    def flaky_urlopen(request: object, timeout: float) -> _FakeResponse:
+        url = getattr(request, "full_url", "")
+        if url.endswith("/robots.txt"):
+            robots_calls.append(url)
+            raise urllib.error.URLError(OSError("robots.txt 不可达"))
+        return _FakeResponse(url, b"page")
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky_urlopen)
     cfg = make_cfg(allow_network=True)
 
     assert fetch_page("http://flaky.example/page1", cfg)[0] == 200  # 失败按允许放行
     assert fetch_page("http://flaky.example/page2", cfg)[0] == 200
-    assert _FlakyRobotsParser.reads == 2  # 未缓存:两次都真实尝试了拉取
-    assert fetcher._ROBOTS_CACHE == {}  # 失败结果绝不进入缓存
+    assert len(robots_calls) == 1  # TTL 负缓存生效:第二次未再真实拉取
+    assert fetcher._ROBOTS_CACHE["flaky.example"][1] is None  # 负缓存条目值为 None
+
+    monkeypatch.setattr(fetcher, "ROBOTS_CACHE_TTL_S", 0.0)  # TTL 归零即刻过期
+    assert fetch_page("http://flaky.example/page3", cfg)[0] == 200
+    assert len(robots_calls) == 2  # 过期后允许再次尝试拉取
 
 
 def test_v5_download_images_abandons_host_after_consecutive_failures(

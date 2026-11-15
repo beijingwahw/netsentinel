@@ -421,12 +421,19 @@ def run_scan_v7(
 
     report = _default_run_scan(url, cfg, **deps)
 
-    # ② SPRT 送审演算 → intel["sprt"](纯预算参考;绝不改动 verdict 等判定字段)
+    # ② SPRT 送审演算 → intel["sprt"](纯预算参考;绝不改动 verdict 等判定字段)。
+    # V10.37:orchestrator 实时接线激活时 intel["sprt"] 已带 ``active`` 真数
+    # (实际送审/判停/省下张数),事后演算**不覆写**——单一事实源;演算只在
+    # 实时接线未激活(如注入路径跑 v7 包装)时作为预算参考写入。
     if box.flags.get("sprt"):
-        try:
-            report.intel["sprt"] = _sprt_intel(report, cfg)
-        except Exception as exc:  # noqa: BLE001 - 预算参考缺失不影响判定
-            logger.warning("SPRT 送审演算已跳过(判定结论不受影响):%s", exc)
+        existing = report.intel.get("sprt")
+        if isinstance(existing, dict) and existing.get("active"):
+            pass  # 实时接线已写真数,演算让位
+        else:
+            try:
+                report.intel["sprt"] = _sprt_intel(report, cfg)
+            except Exception as exc:  # noqa: BLE001 - 预算参考缺失不影响判定
+                logger.warning("SPRT 送审演算已跳过(判定结论不受影响):%s", exc)
 
     # ③ 可靠性加权融合补算 → 覆写 intel["fusion"](只升不降兜底由内核自带)
     if box.flags.get("reliability_fusion") and isinstance(
@@ -510,12 +517,18 @@ def _page_template_key(page: Any) -> str:
 
 
 def _graph_commit(graph: Any) -> None:
-    """尽力提交图谱连接的挂起事务(duck 访问,失败静默降级)。"""
-    conn = getattr(graph, "_conn", None)
-    if conn is None:
+    """尽力提交图谱连接的挂起事务(失败静默降级)。
+
+    只走 A46 公开提交口 ``commit_pending``(加锁提交,见
+    ``intel/graph.py``);旧版直接 duck 访问私有属性 ``graph._conn`` 的
+    路径已作废——图谱实例缺 ``commit_pending`` 时直接跳过,不回退私有
+    访问。
+    """
+    commit = getattr(graph, "commit_pending", None)
+    if not callable(commit):
         return
     try:
-        conn.commit()
+        commit()
     except Exception:  # noqa: BLE001 - 提交失败由上层计数降级,不上抛
         logger.debug("图谱事务提交失败(按降级处理)", exc_info=True)
 
@@ -732,21 +745,19 @@ def _register_phash(
     mirror_registered = 0
     registered = 0
     try:
+        # V10.13:登记行先收集、循环后一次 register_many 批量落库(N 次单行
+        # 事务 → 1 次);LSH 条件插入仍在循环内原位执行(查重语义不变)。
+        rows: list[tuple[str, ...]] = []
         for item in fingerprints:
             sha, fingerprint, mirror, pyramid = _fp_parts(item)
             if not sha:
                 continue
             if multihash:
-                registry.register(
-                    sha,
-                    fingerprint,
-                    site_url,
-                    mirror_hash=mirror or None,
-                    pyramid_hash=pyramid or None,
+                rows.append(
+                    (sha, fingerprint, site_url, "", mirror or None, pyramid or None)
                 )
             else:
-                registry.register(sha, fingerprint, site_url)
-            registered += 1
+                rows.append((sha, fingerprint, site_url))
             if not any(
                 _hit_field(payload, "sha256") == sha
                 for payload in index.query(fingerprint, 0)
@@ -766,6 +777,24 @@ def _register_phash(
                         {"sha256": sha, "site": site_url, "kind": "mirror"},
                     )
                     mirror_registered += 1
+        if rows:
+            bulk = getattr(registry, "register_many", None)
+            if callable(bulk):
+                registered = int(bulk(rows))
+            else:  # 旧实例/注入替身只有逐条口:回退顺序登记,语义一致
+                for row in rows:
+                    if len(row) > 3:
+                        registry.register(
+                            row[0],
+                            row[1],
+                            row[2],
+                            row[3],
+                            mirror_hash=row[4],
+                            pyramid_hash=row[5],
+                        )
+                    else:
+                        registry.register(row[0], row[1], row[2])
+                registered = len(rows)
         if registered:
             index.flush()
         if mirror_index is not None and mirror_registered:
@@ -963,6 +992,21 @@ def _wire_phash_near(
         return 0
 
 
+def _link_touched(graph: Any, attr: str, site_url: str) -> int:
+    """link_* 增量接线辅助(V10.14):优先 ``touched_sites=[site_url]`` 增量
+    模式;调用方注入的替身/旧实例不接受该关键字时回退全量调用(结果
+    语义等价,仅计算量不同)。"""
+    fn = getattr(graph, attr, None)
+    if not callable(fn):
+        raise RuntimeError(
+            f"EvidenceGraph 缺少公开接口 {attr}(A46 在席接口),无法折叠关联边"
+        )
+    try:
+        return int(fn(touched_sites=[site_url]))
+    except TypeError:
+        return int(fn())
+
+
 def wire_graph_from_scan(
     site_url: str, cfg: Config, pages: Iterable[Any]
 ) -> dict[str, int]:
@@ -1015,22 +1059,39 @@ def wire_graph_from_scan(
     try:
         graph.add_site(site_url)
         counts["sites"] = 1
-        seen_shas: set[str] = set()
-        seen_templates: set[str] = set()
+        # V10.13:先收集去重(首见序),再批级单事务写入(N 次单行事务 →
+        # 1 次);旧实例/注入替身缺 bulk 口时回退逐条写,语义一致。
+        shas: list[str] = []
+        templates: list[str] = []
         for page in pages:
             template = _page_template_key(page)
-            if template and template not in seen_templates:
-                seen_templates.add(template)
-                graph.add_template(template, site_url)
-                counts["templates"] += 1
+            if template and template not in templates:
+                templates.append(template)
             for img in getattr(page, "image_evidences", None) or []:
                 sha = str(getattr(img, "sha256", "") or "").strip().lower()
-                if sha and sha not in seen_shas:
-                    seen_shas.add(sha)
-                    graph.add_image(sha, site_url)
-                    counts["images"] += 1
-        counts["shared_image_edges"] = int(graph.link_shared_images())
-        counts["shared_template_edges"] = int(graph.link_templates())
+                if sha and sha not in shas:
+                    shas.append(sha)
+        images_bulk = getattr(graph, "add_images_bulk", None)
+        if callable(images_bulk):
+            counts["images"] = int(images_bulk([(s, site_url) for s in shas]))
+        else:  # pragma: no cover - 旧实例回退路径
+            for s in shas:
+                graph.add_image(s, site_url)
+                counts["images"] += 1
+        templates_bulk = getattr(graph, "add_templates_bulk", None)
+        if callable(templates_bulk):
+            counts["templates"] = int(
+                templates_bulk([(t, site_url) for t in templates])
+            )
+        else:  # pragma: no cover - 旧实例回退路径
+            for t in templates:
+                graph.add_template(t, site_url)
+                counts["templates"] += 1
+        # V10.14:增量 link(等价定理见 graph._link_shared_kind)——本站是
+        # 自上次 link 起唯一素材变化的站点,触及对 ≤ K 个,免全图 K² 重算;
+        # 旧实例/注入替身不接受 touched_sites 关键字时回退全量(语义等价)。
+        counts["shared_image_edges"] = _link_touched(graph, "link_shared_images", site_url)
+        counts["shared_template_edges"] = _link_touched(graph, "link_templates", site_url)
         # ④ 本批 pHash 指纹收集(单图一次;phash 内核缺失 → 登记/建边整体降级;
         #    multihash 开启时同批惰性增算 mirror/pyramid,A229)
         fingerprints: list[tuple[str, ...]] = []

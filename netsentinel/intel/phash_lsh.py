@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any
 
 from netsentinel import telemetry
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 __all__ = [
     "BITS",
@@ -81,9 +82,6 @@ BITS = 64
 
 #: 默认分带数(与 ``Config.phash_lsh_bands`` 缺省一致:4 带 × 16bit)。
 DEFAULT_BANDS = 4
-
-#: 读 PhashRegistry 时的跨连接锁等待毫秒数(与全仓 sqlite 口径一致)。
-_BUSY_TIMEOUT_MS = 5000
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -221,9 +219,10 @@ class LSHIndex:
                 f"build_from 需要 PhashRegistry 实例,得到 "
                 f"{type(registry).__name__}"
             )
-        conn = sqlite3.connect(registry.db_path)
+        # V10.21:只读消费统一经 storage.kernel.connect 工厂(readonly URI
+        # 连接,内置 busy_timeout;绝不写原库,也不会误建空库文件)。
+        conn = sqlite_connect(registry.db_path, readonly=True)
         try:
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             rows = conn.execute(
                 "SELECT sha256, phash, site_url, verdict_tag FROM hashes"
             ).fetchall()
@@ -744,11 +743,13 @@ class MultiTableLSH:
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        """建立连接并原子建表(WAL + busy_timeout,全仓 sqlite 口径)。"""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)  # type: ignore[arg-type]
+        """建立连接并原子建表(WAL + busy_timeout,全仓 sqlite 口径)。
+
+        V10.21:连接统一经 :func:`netsentinel.storage.kernel.connect`
+        工厂(全仓唯一 ``sqlite3.connect`` 入口,PRAGMA 由工厂内置)。
+        """
+        conn = sqlite_connect(self.db_path)  # type: ignore[arg-type]
         try:
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(_MT_SCHEMA_SQL)
             conn.commit()
             return conn

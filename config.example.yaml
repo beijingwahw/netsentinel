@@ -39,6 +39,32 @@ vlm_api_keys: {}           # 提供方 -> 密钥(推荐改用环境变量/密钥
 vlm_fallback_chain: []     # 故障转移链,如 [glm:glm-5.3-flash, openai:gpt-4o-mini, ollama:llava]
 vlm_request_timeout_s: 90
 vlm_max_image_mb: 8
+# ---- V10.29(P0-2):受界并发送审(仅对逐张串行的默认批量分类器生效) ----
+vlm_parallel_workers: 0           # 0=自动档 min(档位 io_workers, 6);1=强制串行;2~16 显式
+provider_rpm: 0                   # 每提供方礼貌限速(令牌桶 RPM,0=不限;
+                                  #   并发下建议按提供方配额设置,如 60)
+# ---- V10.30(P1-5):VLM 扫描预检(爬取之前拦系统性故障,防"爬完才全灭"空烧) ----
+vlm_budget_precheck: true         # 预检总开关(计量检测+健康账本+本地预算;false=逐字节旧行为)
+vlm_health_ttl_s: 300             # 健康账本 TTL:同成员上站系统性失败后,该秒数内后续站点预检直接跳过
+# ---- V10.31(P1-3):站内爬取/推理流水线重叠(仅默认链路生效;判定语义与串行一致) ----
+scan_pipeline_overlap: true       # 主线程逐页礼貌爬取 + 后台按页分块并发评分;false=串行旧行为
+# ---- V10.32(P1-4):同站近重复拦下(phash 先于 VLM;仅同站生效,指纹失败放行) ----
+vlm_neardup_dedup: true           # 送审前 64bit phash 近重复比对(网格站同图多分辨率/重压缩只送代表)
+vlm_neardup_threshold_bits: 4     # 汉明距阈值(64bit;0=仅完全同指纹;实测既有语料近重复率 15%)
+# ---- V10.35(P2-7/8/9):无人值守韧性(优雅退出/遥测落盘/告警重试/断点续跑) ----
+graceful_exit_enabled: true       # 批量扫描链路 Ctrl+C/SIGTERM:停接新站→排空在飞→中文摘要退出
+telemetry_jsonl_path: ""          # 遥测快照落盘路径(空=不落盘;批末/服务关闭各追加一行,如 data/telemetry.jsonl)
+notify_retry_max: 0               # 通知有界重试次数(0=单发不重试=缺省红线;>0=指数退避,只重发通知绝不重发动作)
+notify_retry_backoff_s: 5.0       # 通知重试基础退避秒(每次翻倍;仅 notify_retry_max>0 时生效)
+scan_journal_enabled: true        # 站级扫描日志(SQLite):崩溃后 batchflow --resume-scan <批次号> 跳过已完成站
+scan_journal_db: ""               # 扫描日志库路径(空=<data_dir>/scan_journal.db)
+# ---- V10.37(P2-6):SPRT 实时早停(唯一动准确率的提速项,三道锁强制门禁) ----
+use_sprt: false                   # SPRT 实时早停(判定机器不动,只截断送审)。开启三前提:
+                                  #   ① calibration score → report 门禁五判据全过(正/负人标各 ≥20)
+                                  #   ② calibration approve --kernel sprt 显式批准(绑定测量指纹,重测自动失效)
+                                  #   ③ 门禁未过时响亮降级为全量送审旧行为,绝不阻塞扫描
+sprt_alpha: 0.05                  # 第一类错误上限(把 CLEAN 站误判 NSFW)
+sprt_beta: 0.05                   # 第二类错误上限(把 NSFW 站漏判 CLEAN)
 # 示例:classifier: openai:gpt-4o-mini / qwen:qwen-vl-max / gemini:gemini-2.0-flash
 #       anthropic / ollama:llava(本地,免 vlm_online)
 
@@ -59,6 +85,7 @@ discovery_cache_db: data/discovery_cache.db
 discovery_cache_ttl_h: 168
 yandex_xml_user: ""              # 或环境变量 NETSENTINEL_YANDEX_USER
 yandex_xml_key: ""               # 或环境变量 NETSENTINEL_YANDEX_KEY
+yandex_html_base: ""             # yandex-html 网页检索端点(""=内置默认 https://yandex.com/search/)
 searxng_base_url: "http://127.0.0.1:8888"
 
 # ---- 路径 ----

@@ -9,10 +9,11 @@
 指纹素材 = 排序后的页面 URL 列表 + 排序后的全部图片 sha256
 (无图时退化为仅 URL 列表),整体取 sha256 十六进制前 16 位。
 
-只依赖标准库 sqlite3 / hashlib / threading / datetime;连接以
-``check_same_thread=False`` 建立,统一启用 ``PRAGMA journal_mode=WAL`` 与
-``busy_timeout=5000``(V5:多读者单写者并发更好、锁冲突时等待而非立刻
-SQLITE_BUSY),全部读写经同一把 ``threading.Lock`` 串行化,可在多线程巡查
+连接统一经 :func:`netsentinel.storage.kernel.connect` 工厂建立
+(V10.21:全仓唯一 ``sqlite3.connect`` 入口),统一启用
+``PRAGMA journal_mode=WAL`` 与 ``busy_timeout=5000``(V5:多读者单写者
+并发更好、锁冲突时等待而非立刻 SQLITE_BUSY),全部读写经同一把
+``threading.Lock`` 串行化,可在多线程巡查
 (scheduler)中安全共用;库文件损坏时告警并删除重建(记忆丢了只会多扫一轮,
 不影响正确性——安全方向失效)。
 
@@ -39,8 +40,9 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from netsentinel import telemetry
+from netsentinel import telemetry, timesource
 from netsentinel.contracts import SiteReport
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 __all__ = ["DEFAULT_DB_PATH", "BUSY_TIMEOUT_MS", "SiteMemory"]
 
@@ -99,15 +101,6 @@ def _parse_ts_cached(ts: str) -> _dt.datetime | None:
     return value
 
 
-def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
-    """对新连接启用 WAL 日志与忙等待(幂等;WAL 失败时降级为默认日志)。"""
-    try:
-        conn.execute("PRAGMA journal_mode=WAL").fetchone()
-    except sqlite3.DatabaseError:  # 个别文件系统不支持 WAL:沿用默认日志
-        logger.debug("WAL 日志模式启用失败,沿用默认日志模式", exc_info=True)
-    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-
-
 class SiteMemory:
     """基于 SQLite 的站点指纹记忆:记住指纹,决定"要不要再扫一次"。
 
@@ -137,14 +130,17 @@ class SiteMemory:
     def _open(self) -> sqlite3.Connection:
         """打开(或新建)数据库;文件损坏时删除重建为空库。
 
-        每个新连接统一启用 WAL 日志与忙等待(:func:`_apply_connection_pragmas`,
-        V5):WAL 允许读写并发、busy_timeout 让短暂锁冲突等待 5 秒而不是
-        立刻抛 SQLITE_BUSY。
+        V5:每个新连接统一启用 WAL 日志与忙等待。V10.21:连接统一经
+        :func:`netsentinel.storage.kernel.connect` 工厂(全仓唯一
+        ``sqlite3.connect`` 入口,WAL + busy_timeout 由工厂内置;本模块
+        原私有助手 ``_apply_connection_pragmas`` 及其"WAL 失败静默降级"
+        分支随之收敛——WAL 失败现在如实抛错,与 kernel / graph 等多数
+        存储模块口径一致)。
         """
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn: sqlite3.Connection | None = None
         try:
+            conn = sqlite_connect(self.db_path)
             conn.row_factory = sqlite3.Row
-            _apply_connection_pragmas(conn)
             conn.execute(_SCHEMA_SQL)
             conn.commit()
             return conn
@@ -154,12 +150,12 @@ class SiteMemory:
                 self.db_path,
                 exc_info=True,
             )
-            conn.close()
+            if conn is not None:  # 工厂自抛时已自关,这里兜底幂等
+                conn.close()
             for suffix in ("", "-wal", "-shm", "-journal"):
                 Path(self.db_path + suffix).unlink(missing_ok=True)
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = sqlite_connect(self.db_path)
             conn.row_factory = sqlite3.Row
-            _apply_connection_pragmas(conn)
             conn.execute(_SCHEMA_SQL)
             conn.commit()
             return conn
@@ -169,8 +165,12 @@ class SiteMemory:
     # ------------------------------------------------------------------
 
     def _now(self) -> _dt.datetime:
-        """当前时刻(本地时区,带时区信息;与 contracts.now_iso 同口径)。"""
-        return _dt.datetime.now(_dt.timezone.utc).astimezone()
+        """当前时刻(本地时区,带时区信息;与 contracts.now_iso 同口径)。
+
+        V10.21:取时统一经 :mod:`netsentinel.timesource`(now_local 与旧
+        aware 惯用式逐字节等价);本方法保留为测试时间缝(monkeypatch 点)。
+        """
+        return timesource.now_local()
 
     def _now_iso(self) -> str:
         return self._now().isoformat(timespec="seconds")

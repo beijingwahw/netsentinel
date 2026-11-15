@@ -225,8 +225,16 @@ def _default_server_factory(cfg: Config) -> str | None:
     )
 
 
-def _announce(url: str, should_open: bool) -> None:
-    """按裁决结果通知用户:弹浏览器;不弹 / 弹失败时打印中文提示与地址。"""
+def _announce(url: str, should_open: bool,
+              sink: Any = None) -> None:
+    """按裁决结果通知用户:弹浏览器;不弹 / 弹失败时打印中文提示与地址。
+
+    V10.20 库链路可注入化:提示文案除缺省 ``print``(CLI 行为逐字不变)
+    外,同时 ``logger.info`` 留痕;库集成方可经 ``sink`` 注入自定义接收
+    函数(签名 ``sink(message: str) -> None``,如 GUI 气泡 / 测试捕获),
+    **缺省 None = print**,零破坏。``sink`` 自身抛出的异常不外传
+    (通知失败不影响 ensure_setup 主流程),只记 warning。
+    """
     opened = False
     if should_open:
         try:
@@ -234,7 +242,13 @@ def _announce(url: str, should_open: bool) -> None:
         except Exception as exc:  # noqa: BLE001 - 弹窗失败退回打印,不抛
             logger.warning("打开浏览器失败(退回打印地址):%s", exc)
     if not opened:
-        print(f"未检测到视觉模型,连接向导已启动:{url}", flush=True)
+        message = f"未检测到视觉模型,连接向导已启动:{url}"
+        logger.info("连接向导提示:%s", message)
+        target = sink if sink is not None else (lambda msg: print(msg, flush=True))
+        try:
+            target(message)
+        except Exception as exc:  # noqa: BLE001 - sink 故障只告警,不影响主流程
+            logger.warning("连接向导提示 sink 抛异常(忽略):%s", exc)
 
 
 def ensure_setup(cfg: Config, *, open_browser: bool | None = None,

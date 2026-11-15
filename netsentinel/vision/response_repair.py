@@ -30,6 +30,13 @@ Python 字面量(True/False/None)、python repr 风格、中文引号包裹键�
 修复失败的每一处 None 出口都记 ``telemetry.inc("repair.parse_fail")``
 (V5 可观测:仅失败计数,成功不计数,且只存名称与数字)。
 
+V17 创世纪升级(G2 · 正则预编译):内置兜底解析器的 Python 字面量修复
+(``True/False/None → true/false/null``)原先在 ``_builtin_candidates`` 里
+每次调用 ``re.sub("字面量 pattern", …)`` 临时取式,现改为模块级预编译一次
+(``_BUILTIN_TRUE_RE`` 等),替换语义与逐次构建逐字符一致(等价对照见
+tests/test_genesis_vision.py);语料 ``CORPUS`` 本就在模块导入期一次性构建
+完毕,不存在逐次重建问题,无需改动。
+
 安全红线(对应 CONTRACTS-V4 §0 红线 8"防注入"与总契约红线 8):
 
 - 修复**只提取 JSON 数值字段**;返回内容中出现的任何"指令"
@@ -228,6 +235,10 @@ def _to_float(value: Any) -> float | None:
 
 _BUILTIN_FENCE_RE = re.compile(r"```[A-Za-z0-9_-]*[ \t]*\n?(.*?)```", re.DOTALL)
 _BUILTIN_TRAILING_COMMA_RE = re.compile(r",\s*([}\])])")
+#: (V17)Python 字面量修复正则:模块级预编译一次(原先每次调用临时构建)
+_BUILTIN_TRUE_RE = re.compile(r"\bTrue\b")
+_BUILTIN_FALSE_RE = re.compile(r"\bFalse\b")
+_BUILTIN_NONE_RE = re.compile(r"\bNone\b")
 
 
 def _builtin_parse_json_response(text: str) -> dict[str, Any] | None:
@@ -278,11 +289,15 @@ def _builtin_extract_balanced(text: str) -> str | None:
 
 
 def _builtin_candidates(s: str) -> Iterator[str]:
-    """按修复强度递增给出候选:原文 → 字面量+尾逗号 → 再单引号修复。"""
+    """按修复强度递增给出候选:原文 → 字面量+尾逗号 → 再单引号修复。
+
+    (V17)字面量替换改用模块级预编译正则(``_BUILTIN_TRUE_RE`` 等),
+    替换结果与原先每次调用 ``re.sub`` 临时构建逐字符一致。
+    """
     yield s
-    fixed = re.sub(r"\bTrue\b", "true", s)
-    fixed = re.sub(r"\bFalse\b", "false", fixed)
-    fixed = re.sub(r"\bNone\b", "null", fixed)
+    fixed = _BUILTIN_TRUE_RE.sub("true", s)
+    fixed = _BUILTIN_FALSE_RE.sub("false", fixed)
+    fixed = _BUILTIN_NONE_RE.sub("null", fixed)
     fixed = _BUILTIN_TRAILING_COMMA_RE.sub(r"\1", fixed)
     yield fixed
     yield _builtin_fix_single_quotes(fixed)

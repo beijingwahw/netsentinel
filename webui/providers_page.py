@@ -1319,4 +1319,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    # V10.20(SystemExit 收尾修复,同 webui/app.py):streamlit 脚本线程内
+    # 不抛 SystemExit(BaseException 会杀死脚本线程,AppTest 通道失效);
+    # 仅真直跑才转进程退出码(保留缺依赖提示退出码 1 契约)。
+    _in_script_thread = False
+    if _HAS_ST:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+            _in_script_thread = get_script_run_ctx() is not None
+        except Exception:  # noqa: BLE001 - 内部 API 缺席按直跑处理
+            _in_script_thread = False
+    if not _in_script_thread:
+        raise SystemExit(_exit_code)

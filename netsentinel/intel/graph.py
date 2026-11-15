@@ -42,8 +42,13 @@ import logging
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Iterable
 
-from netsentinel import telemetry
+from netsentinel import telemetry, timesource
+from netsentinel.storage.kernel import connect as sqlite_connect
+
+#: 增量 link 模式的触及站点数上限(超过即回退全量;SQLite 变量数防御)
+LINK_INCREMENTAL_MAX_TOUCHED: int = 256
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +67,6 @@ __all__ = [
 
 #: 默认库路径(与 contracts.Config.graph_db 的 "data/graph.db" 约定一致)。
 DEFAULT_DB_PATH = "data/graph.db"
-
-#: sqlite 连接统一设置:写前等待锁的最长毫秒数(V5,与全仓 sqlite 口径一致)。
-_BUSY_TIMEOUT_MS = 5000
 
 # ---- 节点种类(契约:kind ∈ site|image|template)----
 NODE_SITE = "site"
@@ -265,17 +267,18 @@ class EvidenceGraph:
     def _open(self) -> sqlite3.Connection:
         """打开(或新建)数据库;文件损坏时删除重建为空库。
 
-        V5:两个路径都启用 ``PRAGMA journal_mode=WAL``(扫描线程写入与
-        复核台 / 仪表盘读取并发不阻塞)与 ``busy_timeout=5000``(跨连接
-        短暂锁竞争时等待重试,替代立即抛 ``database is locked``)。
+        V5:两个路径的连接统一 WAL(扫描线程写入与复核台 / 仪表盘读取
+        并发不阻塞)与 ``busy_timeout=5000``(跨连接短暂锁竞争时等待重试,
+        替代立即抛 ``database is locked``)。V10.21:连接统一经
+        :func:`netsentinel.storage.kernel.connect` 工厂(全仓唯一
+        ``sqlite3.connect`` 入口,PRAGMA 由工厂内置,口径不变)。
         A244:两个路径都经 :func:`_ensure_schema` 建表 + 旧库 edges 表
         kind CHECK 迁移(增补 mirror_near,老边零迁移)。
         """
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn: sqlite3.Connection | None = None
         try:
+            conn = sqlite_connect(self.db_path)
             conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA journal_mode = WAL")
             _ensure_schema(conn)
             conn.commit()
             return conn
@@ -286,13 +289,12 @@ class EvidenceGraph:
                 exc_info=True,
             )
             telemetry.inc("graph.rebuild")
-            conn.close()
+            if conn is not None:  # 工厂自抛时已自关,这里兜底幂等
+                conn.close()
             for suffix in ("", "-wal", "-shm", "-journal"):
                 Path(self.db_path + suffix).unlink(missing_ok=True)
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = sqlite_connect(self.db_path)
             conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA journal_mode = WAL")
             _ensure_schema(conn)
             conn.commit()
             return conn
@@ -302,8 +304,12 @@ class EvidenceGraph:
     # ------------------------------------------------------------------
 
     def _now(self) -> _dt.datetime:
-        """当前时刻(本地时区,带时区信息;与 contracts.now_iso 同口径)。"""
-        return _dt.datetime.now(_dt.timezone.utc).astimezone()
+        """当前时刻(本地时区,带时区信息;与 contracts.now_iso 同口径)。
+
+        V10.21:取时统一经 :mod:`netsentinel.timesource`(now_local 与旧
+        aware 惯用式逐字节等价);本方法保留为测试时间缝(monkeypatch 点)。
+        """
+        return timesource.now_local()
 
     def _now_iso(self) -> str:
         return self._now().isoformat(timespec="seconds")
@@ -342,25 +348,33 @@ class EvidenceGraph:
             logger.debug("忽略空素材键或空站点:%r / %r(kind=%s)", key, site_url, kind)
             return
         with self._lock:
-            self._ensure_site(site_url)
-            node_id = f"{kind}:{key}"
-            row = self._conn.execute(
-                "SELECT meta FROM nodes WHERE id = ?", (node_id,)
-            ).fetchone()
-            meta = _load_meta(row["meta"]) if row is not None else {}
-            sites = sorted({str(s) for s in meta.get("sites", []) if s} | {site_url})
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO nodes (id, kind, meta) VALUES (?, ?, ?)",
-                    (node_id, kind, json.dumps({"sites": sites}, ensure_ascii=False)),
-                )
-            elif sites != list(meta.get("sites", [])):
-                self._conn.execute(
-                    "UPDATE nodes SET meta = ? WHERE id = ?",
-                    (json.dumps({"sites": sites}, ensure_ascii=False), node_id),
-                )
+            self._add_media_node_locked(kind, key, site_url)
             self._conn.commit()
         logger.debug("已记录素材:%s:%s @ %s", kind, key[:16], site_url)
+
+    def _add_media_node_locked(self, kind: str, key: str, site_url: str) -> None:
+        """:meth:`_add_media_node` 的无锁无提交内核(调用方须已持 self._lock)。
+
+        语义与单条版完全一致;拆出仅供 :meth:`add_media_bulk` 在同一事务
+        内复用(V10.13:批级合并提交,N 次单行事务 → 1 次)。
+        """
+        self._ensure_site(site_url)
+        node_id = f"{kind}:{key}"
+        row = self._conn.execute(
+            "SELECT meta FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        meta = _load_meta(row["meta"]) if row is not None else {}
+        sites = sorted({str(s) for s in meta.get("sites", []) if s} | {site_url})
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO nodes (id, kind, meta) VALUES (?, ?, ?)",
+                (node_id, kind, json.dumps({"sites": sites}, ensure_ascii=False)),
+            )
+        elif sites != list(meta.get("sites", [])):
+            self._conn.execute(
+                "UPDATE nodes SET meta = ? WHERE id = ?",
+                (json.dumps({"sites": sites}, ensure_ascii=False), node_id),
+            )
 
     # ------------------------------------------------------------------
     # 写口(全部幂等)
@@ -380,6 +394,48 @@ class EvidenceGraph:
     def add_template(self, simhash: str, site_url: str) -> None:
         """记录页面模板 simhash 出现在某站点(同 add_image 语义)。"""
         self._add_media_node(NODE_TEMPLATE, simhash, site_url)
+
+    def add_media_bulk(
+        self, items: "Iterable[tuple[str, str]]", *, node_kind: str
+    ) -> int:
+        """批量记录"站点出现过素材"(V10.13):整批**一次**锁 + 一次 commit。
+
+        - ``items`` 为 ``(素材键, site_url)`` 二元组序列;``node_kind``
+          取 :data:`NODE_IMAGE` / :data:`NODE_TEMPLATE`(公开入口
+          :meth:`add_images_bulk` / :meth:`add_templates_bulk`);
+        - 单条语义与 :meth:`add_image` / :meth:`add_template` 完全一致
+          (幂等 upsert、空键跳过、站点节点自动补建);
+        - 性能:N 条从 N 次单行事务(各一次 WAL fsync)降为 1 次——
+          扫描批末通电(kernel_wire 逐图/逐页登记)的主要写放大来源;
+        - 异常时整批回滚(单事务),不落半截数据。
+
+        :return: 实际处理的条数(空键跳过不计)。
+        """
+        pairs = [(str(k or ""), str(s or "")) for k, s in items]
+        with self._lock:
+            n = 0
+            try:
+                for key, site_url in pairs:
+                    if not key or not site_url:
+                        logger.debug(
+                            "忽略空素材键或空站点:%r / %r(kind=%s)", key, site_url, node_kind
+                        )
+                        continue
+                    self._add_media_node_locked(node_kind, key, site_url)
+                    n += 1
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return n
+
+    def add_images_bulk(self, items: "Iterable[tuple[str, str]]") -> int:
+        """批量 :meth:`add_image`(单事务;语义一致,见 :meth:`add_media_bulk`)。"""
+        return self.add_media_bulk(items, node_kind=NODE_IMAGE)
+
+    def add_templates_bulk(self, items: "Iterable[tuple[str, str]]") -> int:
+        """批量 :meth:`add_template`(单事务;语义一致,见 :meth:`add_media_bulk`)。"""
+        return self.add_media_bulk(items, node_kind=NODE_TEMPLATE)
 
     def add_redirect(self, src_url: str, dst_url: str, weight: float = 1.0) -> None:
         """记录一条站点间重定向边(A47 trace_redirects 每跳调用;幂等)。
@@ -441,7 +497,9 @@ class EvidenceGraph:
     # 关联发现:把共享素材折叠成站点间边
     # ------------------------------------------------------------------
 
-    def _link_shared_kind(self, node_kind: str, edge_kind: str) -> int:
+    def _link_shared_kind(
+        self, node_kind: str, edge_kind: str, touched_sites: "Iterable[str] | None" = None
+    ) -> int:
         """公共实现:同 kind 素材出现在 ≥2 站点 → 两两站点间建边。
 
         - 权重 = 该站点对共享的该类素材数 / 两站点该类素材并集数;
@@ -455,7 +513,43 @@ class EvidenceGraph:
         写;站点对枚举本身是输出规模所必需(Σk² 个对),但每对一次
         SQL 往返的开销被整批摊平。整体耗时记
         ``telemetry.timer("graph.link")``。
+
+        V10.18:全量路径并集分母同步改经恒等式 |a∪b| = |a|+|b|−|a∩b|
+        计算(与增量路径同口径),站点侧只维护计数——免逐对物化并集
+        临时集合;整数输入不变 ⇒ 权重浮点商逐位不变(等价性测试
+        test_graph.py 以暴力 set 并集为参照锁定)。
+
+        V10.14 增量模式(``touched_sites`` 给定且非空;``None``/空 = 全量
+        路径,与旧版逐字节一致):
+
+        **等价定理(append-only 前提)**:本类素材写口只有
+        ``add_image/add_template(+bulk)``,meta.sites 单调增长、无删除;
+        故自上次 link 起,凡两端点均未被触及的站点对 (a, b),其
+        |items_a|、|items_b|、|items_a ∩ items_b| 全部不变 ⇒ 权重不变、
+        共享状态不变、不可能变陈旧 ⇒ 该对的边状态与全量重算完全一致。
+        增量模式因此只需:
+
+        1. 单遍扫 kind 节点,维护每站素材**计数**(并集分母用
+           |a|+|b|−|a∩b| 恒等式,免物化全站素材集合)并收集触及节点;
+        2. 只对"含触及站点"的站点对枚举共享(触及站点对 ≤ K 个,
+           全量为 ≤ K² 个)——每次通电复杂度 O(K²) → O(K);
+        3. 只读触及端点的既有边(SQL IN 限定,免全边表扫描),对触及对
+           做 upsert / 对触及对中不再共享者 delete(append-only 下恒空,
+           保留以对称覆盖未来非 append-only 写口)。
+
+        **调用契约**:``touched_sites`` 必须覆盖自上次 link 以来**全部**
+        素材发生变化的站点(URL 形态,内部经 ``_site_id`` 归一);漏报
+        的站点对其边会保持旧值(不破坏数据,只滞后——下次全量 link
+        自愈)。触及数 > :data:`LINK_INCREMENTAL_MAX_TOUCHED` 时自动
+        回退全量模式(SQL 变量数防御)。
         """
+        touched_urls = [str(u) for u in touched_sites] if touched_sites else []
+        if touched_urls:
+            touched_ids = {_site_id(u) for u in touched_urls}
+            if 0 < len(touched_ids) <= LINK_INCREMENTAL_MAX_TOUCHED:
+                return self._link_shared_kind_incremental(
+                    node_kind, edge_kind, touched_urls, touched_ids
+                )
         with telemetry.timer("graph.link"), self._lock:
             rows = self._conn.execute(
                 "SELECT id, meta FROM nodes WHERE kind = ?", (node_kind,)
@@ -466,8 +560,10 @@ class EvidenceGraph:
                     "SELECT id FROM nodes WHERE kind = ?", (NODE_SITE,)
                 )
             }
-            # 站点 → 其名下该类素材集合(用于算并集分母)
-            site_items: dict[str, set[str]] = {}
+            # 站点 → 其名下该类素材计数(V10.18:并集分母只需计数,免物化
+            # 全站素材集合;nodes.id 唯一 ⇒ 每行对站点恰贡献 1,计数与
+            # 旧版 set 的 len 严格相等)
+            site_counts: dict[str, int] = {}
             # 站点对 → 共享的素材集合(分子,只在 ≥2 站点出现时产生)
             pair_shared: dict[tuple[str, str], set[str]] = {}
             for row in rows:
@@ -479,7 +575,7 @@ class EvidenceGraph:
                     }
                 )
                 for site in sites:
-                    site_items.setdefault(site, set()).add(row["id"])
+                    site_counts[site] = site_counts.get(site, 0) + 1
                 for i in range(len(sites)):
                     for j in range(i + 1, len(sites)):
                         pair_shared.setdefault((sites[i], sites[j]), set()).add(row["id"])
@@ -492,8 +588,17 @@ class EvidenceGraph:
             }
             wanted: dict[tuple[str, str], float] = {}
             for (site_a, site_b), shared in pair_shared.items():
-                union = site_items.get(site_a, set()) | site_items.get(site_b, set())
-                weight = (len(shared) / len(union)) if union else 0.0
+                # V10.18:并集分母改经恒等式 |a∪b| = |a|+|b|−|a∩b| 计算
+                # (pair_shared[(a,b)] 即 a∩b 的同 kind 节点集,与增量路径
+                # 同口径)——免逐对物化 |a|+|b| 大小的临时并集集合(全对
+                # 连通场景 O(P·S) → O(P));整数输入逐位相同 ⇒ 浮点商与
+                # 旧版 len(a|b) 除法逐位相同,权重零变化。
+                union_size = (
+                    site_counts.get(site_a, 0)
+                    + site_counts.get(site_b, 0)
+                    - len(shared)
+                )
+                weight = (len(shared) / union_size) if union_size > 0 else 0.0
                 wanted[(_site_id(site_a), _site_id(site_b))] = weight
 
             now = self._now_iso()
@@ -523,16 +628,121 @@ class EvidenceGraph:
         )
         return new_count
 
-    def link_shared_images(self) -> int:
+    def _link_shared_kind_incremental(
+        self,
+        node_kind: str,
+        edge_kind: str,
+        touched_urls: list[str],
+        touched_ids: set[str],
+    ) -> int:
+        """增量折叠实现(等价定理与调用契约见 :meth:`_link_shared_kind` docstring)。
+
+        与全量路径的数值一致性由构造保证:权重经恒等式
+        ``|a ∪ b| = |a| + |b| − |a ∩ b|`` 以整数计数得出,与全量的
+        ``len(set 并集)`` 完全等值(整数运算,除法输入逐位相同 ⇒ 浮点
+        商逐位相同)。
+        """
+        with telemetry.timer("graph.link.incremental"), self._lock:
+            site_ids = {
+                row["id"]
+                for row in self._conn.execute(
+                    "SELECT id FROM nodes WHERE kind = ?", (NODE_SITE,)
+                )
+            }
+            touched_url_set = {_site_id(u) for u in touched_urls}
+            # 站点 → 该类素材计数(并集分母);触及节点 → (node_id, 全部站点)
+            site_counts: dict[str, int] = {}
+            touched_nodes: list[tuple[str, list[str]]] = []
+            for row in self._conn.execute(
+                "SELECT id, meta FROM nodes WHERE kind = ?", (node_kind,)
+            ).fetchall():
+                sites = sorted(
+                    {
+                        str(s)
+                        for s in _load_meta(row["meta"]).get("sites", [])
+                        if s and _site_id(str(s)) in site_ids
+                    }
+                )
+                if not sites:
+                    continue
+                for site in sites:
+                    site_counts[site] = site_counts.get(site, 0) + 1
+                if any(_site_id(s) in touched_url_set for s in sites):
+                    touched_nodes.append((str(row["id"]), sites))
+
+            # 触及站点对 → 共享素材集合(只枚举含触及站点的对,键序与全量一致)
+            pair_shared: dict[tuple[str, str], set[str]] = {}
+            for node_id, sites in touched_nodes:
+                for i in range(len(sites)):
+                    for j in range(i + 1, len(sites)):
+                        a, b = sites[i], sites[j]
+                        if _site_id(a) in touched_url_set or _site_id(b) in touched_url_set:
+                            pair_shared.setdefault((a, b), set()).add(node_id)
+
+            wanted: dict[tuple[str, str], float] = {}
+            for (site_a, site_b), shared in pair_shared.items():
+                union = (
+                    site_counts.get(site_a, 0)
+                    + site_counts.get(site_b, 0)
+                    - len(shared)
+                )
+                weight = (len(shared) / union) if union > 0 else 0.0
+                wanted[(_site_id(site_a), _site_id(site_b))] = weight
+
+            # 只读触及端点的既有边(SQL IN 限定;免全边表扫描)
+            ph = ",".join("?" * len(touched_ids))
+            existing = {
+                (row["src"], row["dst"])
+                for row in self._conn.execute(
+                    f"SELECT src, dst FROM edges WHERE kind = ?"
+                    f" AND (src IN ({ph}) OR dst IN ({ph}))",
+                    (edge_kind, *sorted(touched_ids), *sorted(touched_ids)),
+                ).fetchall()
+            }
+
+            now = self._now_iso()
+            new_count = 0
+            upserts: list[tuple[str, str, str, float, str]] = []
+            for (src, dst), weight in sorted(wanted.items()):
+                if (src, dst) not in existing:
+                    new_count += 1
+                upserts.append((src, dst, edge_kind, weight, now))
+            deletes = [
+                (src, dst, edge_kind)
+                for src, dst in sorted(existing - set(wanted))
+            ]
+            if upserts:
+                self._conn.executemany(_UPSERT_EDGE_SQL, upserts)
+            if deletes:
+                self._conn.executemany(
+                    "DELETE FROM edges WHERE src = ? AND dst = ? AND kind = ?",
+                    deletes,
+                )
+            self._conn.commit()
+        logger.debug(
+            "link.incremental(%s) 完成:触及 %d 站点,现存触及对 %d,本次新增 %d 条",
+            edge_kind,
+            len(touched_ids),
+            len(wanted),
+            new_count,
+        )
+        return new_count
+
+    def link_shared_images(self, touched_sites: "Iterable[str] | None" = None) -> int:
         """同一 image(sha256)出现在 ≥2 站点 → 两两站点间 shared_image 边。
 
         返回新增边数;重跑幂等(返回 0)并刷新权重 / 清理陈旧边。
+        ``touched_sites`` 给定时走增量模式(等价定理见
+        :meth:`_link_shared_kind`;须覆盖自上次 link 起素材有变化的全部站点)。
         """
-        return self._link_shared_kind(NODE_IMAGE, EDGE_SHARED_IMAGE)
+        return self._link_shared_kind(NODE_IMAGE, EDGE_SHARED_IMAGE, touched_sites)
 
-    def link_templates(self) -> int:
-        """同一 template(simhash)出现在 ≥2 站点 → 两两站点间 shared_template 边。"""
-        return self._link_shared_kind(NODE_TEMPLATE, EDGE_SHARED_TEMPLATE)
+    def link_templates(self, touched_sites: "Iterable[str] | None" = None) -> int:
+        """同一 template(simhash)出现在 ≥2 站点 → 两两站点间 shared_template 边。
+
+        ``touched_sites`` 增量模式语义同 :meth:`link_shared_images`。
+        """
+        return self._link_shared_kind(NODE_TEMPLATE, EDGE_SHARED_TEMPLATE, touched_sites)
 
     # ------------------------------------------------------------------
     # 查询口
@@ -661,6 +871,19 @@ class EvidenceGraph:
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+
+    def commit_pending(self) -> None:
+        """提交当前挂起事务(公开提交口)。
+
+        供 ``pipeline.kernel_wire`` 等外部装配层在批量写边后调用,替代旧版
+        对私有属性 ``graph._conn`` 的 duck 访问(该私有穿透路径已作废);
+        与各写口共用同一把 ``self._lock`` 加锁后 commit。本类各写口
+        (:meth:`add_site` / :meth:`add_edge` / ...)本就即时提交,本方法
+        只是把"提交"这一动作本身暴露为公开 API:幂等,无挂起事务时无
+        副作用。
+        """
+        with self._lock:
+            self._conn.commit()
 
     def close(self) -> None:
         """关闭底层连接(容忍重复关闭)。"""

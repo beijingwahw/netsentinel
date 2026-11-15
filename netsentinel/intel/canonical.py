@@ -19,9 +19,17 @@ scheme 各异的 URL 归一到**可注册域**(registrable domain)::
 www/子域/端口/路径差异由 alias_label 记为中文变体描述。
 纯标准库(urllib.parse / ipaddress),零网络、零落盘;结果决定且恒为小写。
 A107 bulk_intake 负责给裸域名补 scheme,本模块不猜测、按契约口径返回 ""。
+
+V10.18:``canonical_key`` 为纯函数(str→str、零副作用),批量链路
+(bulk_intake / batch_scan / group_linker)会对同一 URL 反复调用——
+整体套 ``functools.lru_cache(maxsize=2048)``(标准库实现,线程安全;
+容量 2048 足够覆盖单批工作集,超出按 LRU 淘汰,命中语义不变)。
+公开入口名与签名不变;未缓存原函数经 ``canonical_key.__wrapped__``
+可访问,供等价性测试(随机 URL 集合缓存开/关结果全等)使用。
 """
 from __future__ import annotations
 
+import functools
 import ipaddress
 from urllib.parse import urlsplit
 
@@ -77,6 +85,7 @@ def _split_host(url: str) -> tuple[str, int | None, str]:
     return host, port, path
 
 
+@functools.lru_cache(maxsize=2048)
 def canonical_key(url: str) -> str:
     """把任意 URL 归一为可注册域小写键;IP 直连返回 IP 串;失败返回 ""。
 
@@ -88,7 +97,8 @@ def canonical_key(url: str) -> str:
     - ``http://localhost:8080/app`` → ``localhost``(单标签原样);
     - ``"not a url"`` / 空串 / 无 host → ``""``。
 
-    端口/查询/片段/scheme/路径差异不影响结果;函数纯本地、决定、恒小写。
+    端口/查询/片段/scheme/路径差异不影响结果;函数纯本地、决定、恒小写,
+    结果只依赖入参,故外层 lru_cache(2048) 对调用方完全透明。
     """
     host, _port, _path = _split_host(url)
     if not host:

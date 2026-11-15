@@ -35,6 +35,14 @@ V5 升级(契约 §1):
   对齐 crawler/browser.py 的 networkidle 容错先例);
 - 每一级等待结果全部写入 step notes(审计可见);干跑路径行为不变(只记 notes)。
 
+双执行器共享步骤编排(V17 · G5):
+- :func:`_run_plan_steps` 统一承载「逐 Step 循环 + stopped_label 推导 + Ctrl+C
+  人工取消 + 步骤异常捕获 + 完成收尾」的编排逻辑,供本模块
+  :func:`_run_with_browser` 与 :mod:`netsentinel.submit.executor_session`
+  (会话复用内核)共同导入——两执行器的逐步语义/notes 文案由此保证逐字一致;
+  步骤解释本体仍在 :func:`_perform_step`(单步)与
+  :func:`_resolve_step_target`(选择器解析),未做任何拷贝。
+
 自愈选择器候选链(V13,对标 Healenium / Selenium AI 式 self-healing selector):
 - ``Step.meta["selector_chain"]`` 声明有序候选链(候选类型:css /
   role+name / label / placeholder / text);未声明(或链长为 1)时走 v1
@@ -58,13 +66,13 @@ V5 升级(契约 §1):
 """
 from __future__ import annotations
 
-import datetime as _dt
 import logging
 import pathlib
 import time
 from typing import Any, Callable
 
 from netsentinel import telemetry
+from netsentinel import timesource
 from netsentinel.contracts import (
     Config,
     ExecutionResult,
@@ -451,14 +459,19 @@ def execute(
       仍随结果返回。
     - ``auto_confirm=True`` 仅用于测试:把 ``HUMAN_GATE`` 的交互等待替换为
       notes 记录,绝不用于绕过真实提交前的人工确认红线。
+    - V10.20 证据池感知去重开关:``getattr(cfg, "evidence_pool_dedup"``,
+      ``True)``(默认开)透传 evidence_pool;``evidence_pool_dedup: false``
+      一键回旧口径(不去重)。
     """
     if dry_run is None:
         dry_run = bool(cfg.dry_run_default)
 
+    dedup = bool(getattr(cfg, "evidence_pool_dedup", True))
+
     if out_dir is not None:
         out_path = pathlib.Path(out_dir)
     else:
-        out_path = pathlib.Path(cfg.data_dir) / "runs" / _dt.datetime.now().strftime(
+        out_path = pathlib.Path(cfg.data_dir) / "runs" / timesource.now_local().strftime(
             _RUN_TS_FORMAT
         )
     try:
@@ -468,11 +481,12 @@ def execute(
 
     result = ExecutionResult(portal=plan.portal.value)
     if dry_run:
-        return _dry_run(plan, result)
+        return _dry_run(plan, result, dedup=dedup)
     # V5:真实模式整体计时;提交成功(仅 submitted=True)计数
     with telemetry.timer(_METRIC_RUN):
         executed = _run_with_browser(
-            plan, result, out_path, auto_confirm=auto_confirm, headless=headless
+            plan, result, out_path,
+            auto_confirm=auto_confirm, headless=headless, dedup=dedup,
         )
     if executed.submitted:
         telemetry.inc(_METRIC_SUBMITTED)
@@ -483,8 +497,14 @@ def execute(
 # 干跑(纯标准库,CI 可测)
 # ---------------------------------------------------------------------------
 
-def _dry_run(plan: SubmissionPlan, result: ExecutionResult) -> ExecutionResult:
-    """干跑:不导入任何三方库,逐 Step 记录 notes。"""
+def _dry_run(
+    plan: SubmissionPlan, result: ExecutionResult, *, dedup: bool = True
+) -> ExecutionResult:
+    """干跑:不导入任何三方库,逐 Step 记录 notes。
+
+    ``dedup`` 为 V10.20 证据池感知去重开关(缺省开,execute 依
+    ``cfg.evidence_pool_dedup`` 透传)。
+    """
     result.notes.append(DRY_RUN_BANNER)
     for i, step in enumerate(plan.steps, start=1):
         if step.action is StepAction.HUMAN_GATE:
@@ -493,6 +513,33 @@ def _dry_run(plan: SubmissionPlan, result: ExecutionResult) -> ExecutionResult:
                 f"[DRY] {i}. {step.action.value} {step.label} "
                 "干跑跳过(等待人工确认的环节未执行)"
             )
+            # V10.16:命中证据截图池时预演提示(无池零 notes,既有断言不受扰);
+            # V10.20:感知去重剔除计数随池留痕一并预演提示
+            try:
+                from netsentinel.submit.evidence_pool import (  # 惰性
+                    files_for_portal,
+                    pool_dropped_near_duplicate,
+                )
+
+                will_upload = files_for_portal(
+                    str(getattr(plan.payload, "evidence_zip", "") or ""),
+                    plan.portal,
+                    dedup=dedup,
+                )
+                if will_upload:
+                    result.notes.append(
+                        f"[DRY] 证据截图:本门户将自动上传 {len(will_upload)} 张"
+                        "(真实模式于人工门前执行)"
+                    )
+                dropped = pool_dropped_near_duplicate(
+                    str(getattr(plan.payload, "evidence_zip", "") or "")
+                )
+                if dropped:
+                    result.notes.append(
+                        f"[DRY] 证据池感知去重:已按感知去重剔除 {dropped} 张近重复"
+                    )
+            except Exception:  # noqa: BLE001 - 干跑提示失败零影响
+                pass
         else:
             line = (
                 f"[DRY] {i}. {step.action.value} {step.label} "
@@ -521,8 +568,13 @@ def _run_with_browser(
     *,
     auto_confirm: bool,
     headless: bool,
+    dedup: bool = True,
 ) -> ExecutionResult:
-    """驱动 chromium 逐步执行计划;异常捕获为 notes + stopped_at,不向外抛。"""
+    """驱动 chromium 逐步执行计划;异常捕获为 notes + stopped_at,不向外抛。
+
+    ``dedup`` 为 V10.20 证据池感知去重开关(execute 依
+    ``cfg.evidence_pool_dedup`` 透传,缺省开)。
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:  # pragma: no cover - 取决于运行环境
@@ -556,50 +608,11 @@ def _run_with_browser(
             return result
 
         page = browser.new_page()
-        shot_errors = _screenshot_error_types()
-        completed = True
-        for idx, step in enumerate(plan.steps, start=1):
-            stopped_label = step.label or f"step{idx}:{step.action.value}"
-            try:
-                _perform_step(
-                    step,
-                    page=page,
-                    out_path=out_path,
-                    idx=idx,
-                    result=result,
-                    auto_confirm=auto_confirm,
-                    shot_errors=shot_errors,
-                )
-            except KeyboardInterrupt:
-                # 人工门处 Ctrl+C = 人工主动取消
-                result.ok = False
-                result.stopped_at = stopped_label
-                result.notes.append(
-                    f"[取消] 第{idx}步 人工取消(Ctrl+C):{stopped_label}"
-                )
-                logger.info("人工取消:portal=%s stopped_at=%s", plan.portal.value, stopped_label)
-                completed = False
-                break
-            except Exception as exc:
-                telemetry.inc(_METRIC_ERRORS)
-                result.ok = False
-                result.stopped_at = stopped_label
-                result.notes.append(
-                    f"[错误] 第{idx}步({step.action.value} {step.label}):{exc}"
-                )
-                logger.warning("步骤失败(%s):%s", stopped_label, exc)
-                completed = False
-                break
-
-        if completed:
-            result.ok = True
-            result.notes.append(f"计划执行完毕:共 {len(plan.steps)} 步")
-            logger.info(
-                "计划执行完毕:portal=%s submitted=%s screenshots=%d",
-                plan.portal.value,
-                result.submitted,
-                len(result.screenshots),
-            )
+        # V17(G5):步骤循环编排下沉共享 helper(与会话执行器逐字一致)
+        _run_plan_steps(
+            plan, page=page, out_path=out_path, result=result,
+            auto_confirm=auto_confirm, dedup=dedup,
+        )
         return result
     finally:
         if browser is not None:
@@ -625,6 +638,135 @@ def _screenshot_error_types() -> tuple[type[BaseException], ...]:
     except ImportError:  # pragma: no cover - 与调用方导入结果一致,仅防御
         return (OSError,)
     return (OSError, _PlaywrightError)
+
+
+def _run_plan_steps(
+    plan: SubmissionPlan,
+    *,
+    page: Any,
+    out_path: pathlib.Path,
+    result: ExecutionResult,
+    auto_confirm: bool,
+    dedup: bool = True,
+) -> bool:
+    """逐步执行计划全部步骤的共享编排(V17 · G5;双执行器零拷贝共用)。
+
+    统一承载 ``executor_playwright._run_with_browser`` 与
+    ``executor_session.SessionExecutor._run_real`` 原先逐字重复的步骤循环:
+
+    - ``stopped_label`` 推导(label 优先,否则 ``step<idx>:<action>``);
+    - 委托 :func:`_perform_step` 解释并执行单步(含截图窄捕获类型获取);
+    - Ctrl+C = 人工主动取消(``[取消]`` notes + ``stopped_at``,不外抛);
+    - 步骤异常捕获(``[错误]`` notes + ``stopped_at`` 中止 +
+      ``executor.errors`` 计数,绝不向上冒泡);
+    - 全部完成时的收尾(``ok=True`` + "计划执行完毕" notes 与日志);
+    - V10.20:``dedup`` 证据池感知去重开关透传人工门前自动上传
+      (缺省开;executor_playwright 依 ``cfg.evidence_pool_dedup``
+      计算后传入,executor_session 同源)。
+
+    :return: 是否全部步骤执行完成(False = 已中止,细节已写入 ``result``)。
+    """
+    shot_errors = _screenshot_error_types()
+    completed = True
+    for idx, step in enumerate(plan.steps, start=1):
+        stopped_label = step.label or f"step{idx}:{step.action.value}"
+        if step.action is StepAction.HUMAN_GATE:
+            # V10.16:人工门前自动上传证据截图(12377 十张 / shdf 五张);
+            # 上传失败只记 notes 不中断——人工门仍可手动上传核对。
+            _auto_upload_evidence(plan, page=page, idx=idx, result=result, dedup=dedup)
+        try:
+            _perform_step(
+                step,
+                page=page,
+                out_path=out_path,
+                idx=idx,
+                result=result,
+                auto_confirm=auto_confirm,
+                shot_errors=shot_errors,
+            )
+        except KeyboardInterrupt:
+            # 人工门处 Ctrl+C = 人工主动取消
+            result.ok = False
+            result.stopped_at = stopped_label
+            result.notes.append(
+                f"[取消] 第{idx}步 人工取消(Ctrl+C):{stopped_label}"
+            )
+            logger.info("人工取消:portal=%s stopped_at=%s", plan.portal.value, stopped_label)
+            completed = False
+            break
+        except Exception as exc:
+            telemetry.inc(_METRIC_ERRORS)
+            result.ok = False
+            result.stopped_at = stopped_label
+            result.notes.append(
+                f"[错误] 第{idx}步({step.action.value} {step.label}):{exc}"
+            )
+            logger.warning("步骤失败(%s):%s", stopped_label, exc)
+            completed = False
+            break
+
+    if completed:
+        result.ok = True
+        result.notes.append(f"计划执行完毕:共 {len(plan.steps)} 步")
+        logger.info(
+            "计划执行完毕:portal=%s submitted=%s screenshots=%d",
+            plan.portal.value,
+            result.submitted,
+            len(result.screenshots),
+        )
+    return completed
+
+
+def _auto_upload_evidence(
+    plan: SubmissionPlan, *, page: Any, idx: int, result: ExecutionResult,
+    dedup: bool = True,
+) -> None:
+    """人工门前的证据截图自动上传(V10.16;红线 1/2 零触碰)。
+
+    - 配额:12377 十张 / 扫黄打非五张(:mod:`evidence_pool` PORTAL_QUOTA);
+    - 上传口 = ``#report-file``(form_models.SELECTORS["file"],mock 门户在席);
+    - **发生在 HUMAN_GATE 之前**:人工门随即可见核对已传附件、输入验证码
+      并最终确认——验证码与提交永远属于人工;
+    - V10.20:``dedup`` 感知去重开关透传(池内近重复只留最高分);有剔除
+      时 notes 提示"已按感知去重剔除 N 张近重复"(无剔除零 notes);
+    - 任何失败(无池/无文件节点/上传异常)只记 ``[上传]`` notes 降级,
+      绝不中断举报主流程(人工门可手动上传兜底)。
+    """
+    try:
+        from netsentinel.submit.evidence_pool import (  # 惰性
+            files_for_portal,
+            pool_dropped_near_duplicate,
+        )
+
+        zip_path = str(getattr(plan.payload, "evidence_zip", "") or "")
+        files = files_for_portal(zip_path, plan.portal, dedup=dedup)
+        if not files:
+            result.notes.append(
+                f"[上传] 第{idx}步前 无可自动上传的证据截图(人工门可手动上传)"
+            )
+            return
+        from netsentinel.submit.form_models import SELECTORS  # 惰性(冻结表)
+
+        page.set_input_files(SELECTORS["file"], files)
+        result.notes.append(
+            f"[上传] 第{idx}步前 已自动上传 {len(files)} 张证据截图"
+            f"(门户 {getattr(plan.portal, 'value', plan.portal)},人工门请核对附件)"
+        )
+        dropped = pool_dropped_near_duplicate(zip_path)
+        if dropped:
+            result.notes.append(
+                f"[池] 已按感知去重剔除 {dropped} 张近重复"
+                "(同源变体只留 ensemble 分最高,名额回填不重复图)"
+            )
+        logger.info(
+            "证据截图自动上传:portal=%s files=%d dropped_near_duplicate=%d",
+            getattr(plan.portal, "value", ""), len(files), dropped,
+        )
+    except Exception as exc:  # noqa: BLE001 - 上传是辅助动作,失败不阻断
+        result.notes.append(
+            f"[上传] 第{idx}步前 证据截图自动上传失败(人工门可手动上传):{exc}"
+        )
+        logger.warning("证据截图自动上传失败(降级为人工门手动上传):%s", exc)
 
 
 def _perform_step(

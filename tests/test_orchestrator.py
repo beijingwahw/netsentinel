@@ -1192,3 +1192,40 @@ def test_v11_trace_and_abstain_combined(
     assert [n["name"] for n in tree["spans"]] == [
         "scan.fetch", "scan.vlm", "scan.fusion", "scan.review",
     ]
+
+
+# ---------------------------------------------------------------------------
+# V10.18 text_fusion 门控可观测:开关两侧各计一笔(零行为变化)
+# ---------------------------------------------------------------------------
+def test_text_fusion_gate_counters_both_sides(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """enable_text_fusion 缺省(False)→ scan.fusion.text.skipped +1;
+    附加属性开启(True)→ scan.fusion.text.enabled +1;两侧判定与报告
+    口径一致(门控计数不改变任何行为)。"""
+    queue = FakeQueue()
+    _patch_scan_side_effects(monkeypatch, queue)
+    cfg.ensemble_members = []  # 单成员,免集成口径干扰
+    base = telemetry.snapshot()["counters"]
+    base_skip = base.get("scan.fusion.text.skipped", 0.0)
+    base_en = base.get("scan.fusion.text.enabled", 0.0)
+
+    # 侧一:开关缺省关(与主线默认一致)
+    report_off = orchestrator.run_scan(
+        SITE, cfg, capture=FakeCapture(), classifier=make_stub_classifier(cfg)
+    )
+    s1 = telemetry.snapshot()["counters"]
+    assert s1.get("scan.fusion.text.skipped", 0.0) == base_skip + 1
+    assert s1.get("scan.fusion.text.enabled", 0.0) == base_en
+
+    # 侧二:开关开启(附加属性,contracts 冻结不动)
+    cfg.enable_text_fusion = True
+    report_on = orchestrator.run_scan(
+        SITE, cfg, capture=FakeCapture(), classifier=make_stub_classifier(cfg)
+    )
+    s2 = telemetry.snapshot()["counters"]
+    assert s2.get("scan.fusion.text.enabled", 0.0) == base_en + 1
+    assert s2.get("scan.fusion.text.skipped", 0.0) == base_skip + 1
+    # 门控计数零行为变化:两轮判定档位一致(FakeCapture 同规格输入)
+    assert report_on.verdict == report_off.verdict
+    assert report_on.nsw_image_count == report_off.nsw_image_count

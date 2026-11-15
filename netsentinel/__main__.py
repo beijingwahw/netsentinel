@@ -44,6 +44,10 @@ _PORTAL_CN: dict[str, str] = {
 }
 
 
+# 交叉注释(设计说明):本函数在 __main__ / batchflow / finishflow /
+# sessionflow 四处各有一份重复(此处为单参形态)——**入口独立性是设计**
+# (每个 CLI 入口零兄弟依赖、可单独运行),不做收敛;batchflow /
+# finishflow 共用的纯辅助已提取到 netsentinel/_flowutil.py。
 def _load(module_name: str) -> Any:
     """惰性导入兄弟模块;缺失时抛中文 RuntimeError。"""
     try:

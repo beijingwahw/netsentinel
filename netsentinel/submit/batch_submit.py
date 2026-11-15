@@ -28,6 +28,11 @@ auto_confirm=False, dry_run=...)``;⑥ ``submitted`` → ``state.mark(submitted)
 + ``rate.record()`` + 审计;⑦ 异常/失败 → ``state.mark(failed, 中文原因)``
 继续下一条;⑧ 条间 ``sleep(cfg.batch_item_interval_s)`` 仅真实模式执行。
 
+V10.18(决策间隙闭环):③~⑥ 的"频控判定 → 执行 → 记账"整段在频控器
+``locked()`` 文件锁临界区内完成(真 :class:`~netsentinel.submit.rate_limit.
+RateLimiter` 专属;经 ``getattr`` 探测,注入的替身/旧实例无此 API 时自动
+回退现路径),消除判定与记账之间当日额度被并发消耗的 TOCTOU 间隙。
+
 全部依赖(executor / 12377 / shdf 计划器 / RateLimiter / 审计日志器)均
 惰性导入或由调用方注入,测试可完全离线(零 playwright、零网络)。
 
@@ -46,6 +51,7 @@ import importlib
 import logging
 import time
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from typing import Any
 
 from netsentinel import telemetry
@@ -223,6 +229,11 @@ def run_batch(
         (``paused=True``,已完成结果保留,可续批)。
     :param sleep: 条间等待函数(测试注入;真实模式条间等待
         ``cfg.batch_item_interval_s`` 秒)。
+
+    可观测(V10.18,默认关):``cfg.trace_enabled`` 开启时整条提交链包进
+    一条新 trace,逐条开 ``submit.rate_limit`` / ``submit.plan`` /
+    ``submit.execute`` 阶段 span(参照扫描链 scan.* 写法;关闭时零开销
+    直通,行为不变)。
     :return: ``{"submitted": n, "failed": n, "rate_limited": bool, "paused": bool,
         "results": [{entry_id, group_name, ok, submitted, error, portal}], "note": 中文说明}``。
         频控不通过时**整体挂起**(不 sleep 死等),``note`` 说明"额度/间隔限制,
@@ -271,6 +282,26 @@ def run_batch(
             audit_logger = logging_util.JsonlAuditLogger(cfg.audit_path)
         return audit_logger
 
+    # V10.18 提交链路 trace span(参照扫描链 scan.* 现成写法):
+    # cfg.trace_enabled 开启(缺省 False = 现状)时惰性装载追踪内核,把
+    # 整条提交链包进一条新 trace(一链一 trace),三个阶段各开一个 span:
+    # submit.rate_limit(频控判定)/ submit.plan(计划构造)/
+    # submit.execute(执行器);关闭时 _span 恒为 nullcontext 直通,
+    # 零开销、行为与升级前逐字节一致。span attrs 只放阶段标签与门户
+    # 取值(固定词表,红线 17:不含 URL/密钥/路径等内容字段)。
+    trace_mod = (
+        _load("netsentinel.telemetry_trace")
+        if getattr(cfg, "trace_enabled", False)
+        else None
+    )
+    telemetry.inc("batch.trace.enabled" if trace_mod is not None else "batch.trace.disabled")
+
+    def _span(name: str, **attrs: Any) -> Any:
+        """阶段 span 的零开销直通包装(trace 未启用时 nullcontext)。"""
+        if trace_mod is None:
+            return nullcontext()
+        return trace_mod.span(name, attrs=attrs)
+
     submitted_n = 0
     failed_n = 0
     rate_limited = False
@@ -279,7 +310,8 @@ def run_batch(
     results: list[dict[str, Any]] = []
     total = len(items)
 
-    with telemetry.timer(_METRIC_RUN):
+    _trace_ctx = trace_mod.new_trace() if trace_mod is not None else nullcontext()
+    with _trace_ctx, telemetry.timer(_METRIC_RUN):
         for index, item in enumerate(items, start=1):
             # ① 暂停检查(每条开始前;Ctrl-C 语义由调用方转接为 stop 回调)
             if stop is not None and stop():
@@ -299,103 +331,122 @@ def run_batch(
             # ② 状态 → running
             _mark_state(state, entry_id, "running")
 
-            # ③ 频控前置:不通过 → 该条 rate_limited,整体挂起返回(不 sleep 死等)
-            allowed, reason = rate.can_submit()
-            if not allowed:
-                why = f"额度/间隔限制,可续批:{reason}"
-                _mark_state(state, entry_id, "rate_limited", error=why)
-                rate_limited = True
-                note = why
-                telemetry.inc(_METRIC_RATE_LIMITED)
-                results.append(
-                    _result_row(
-                        entry_id,
-                        group_name,
-                        portal_text,
-                        ok=False,
-                        submitted=False,
-                        error=why,
-                    )
-                )
-                logger.warning("频控挂起:index=%d reason=%s", index, reason)
-                break
+            # ③~⑥(V10.18 决策间隙闭环):频控"判定 → 执行 → 记账"整段在
+            # 频控器文件锁临界区内完成,消除"判定通过与 record 落账之间
+            # 当日额度被并发消耗"的 TOCTOU 间隙(典型:两个批量进程同时
+            # 通过判定、各自记账 → 超发)。getattr 探测新 API:旧实例 /
+            # 测试替身无 locked() 时自动回退现路径(can_submit / record
+            # 各自持锁,行为与升级前一致);真 RateLimiter 的段内
+            # can_submit / record 免重入,共享本临界区。
+            _rate_locked = getattr(rate, "locked", None)
+            with _rate_locked() if callable(_rate_locked) else nullcontext():
+                # ③ 频控前置:不通过 → 该条 rate_limited,整体挂起返回
+                # (不 sleep 死等)
+                with _span("submit.rate_limit", stage="rate_limit"):
+                    allowed, reason = rate.can_submit()
+                    if not allowed:
+                        why = f"额度/间隔限制,可续批:{reason}"
+                        _mark_state(state, entry_id, "rate_limited", error=why)
+                        rate_limited = True
+                        note = why
+                        telemetry.inc(_METRIC_RATE_LIMITED)
+                        results.append(
+                            _result_row(
+                                entry_id,
+                                group_name,
+                                portal_text,
+                                ok=False,
+                                submitted=False,
+                                error=why,
+                            )
+                        )
+                        logger.warning("频控挂起:index=%d reason=%s", index, reason)
+                        break
 
-            # ④⑤ 计划构造 + 执行器(auto_confirm 恒 False——红线 24)
-            try:
-                planner = _pick_planner(portal_text, plan_12377, plan_shdf)
-                plan = planner(item, cfg)
-                result = executor(plan, cfg, auto_confirm=False, dry_run=effective_dry_run)
-            except Exception as exc:  # ⑦ 单条异常 → 失败并继续下一条
-                error = f"执行异常:{type(exc).__name__}:{exc}"
-                _mark_state(state, entry_id, "failed", error=error)
-                failed_n += 1
-                telemetry.inc(_METRIC_FAILED)
-                results.append(
-                    _result_row(
-                        entry_id,
-                        group_name,
-                        portal_text,
-                        ok=False,
-                        submitted=False,
-                        error=error,
-                    )
-                )
-                logger.warning("批量单条异常:index=%d entry=%s(%s)", index, entry_id, exc)
-            else:
-                if result is None:
-                    error = "执行失败:执行器未返回任何结果"
+                # ④⑤ 计划构造 + 执行器(auto_confirm 恒 False——红线 24)
+                try:
+                    planner = _pick_planner(portal_text, plan_12377, plan_shdf)
+                    with _span("submit.plan", stage="plan", portal=portal_text):
+                        plan = planner(item, cfg)
+                    with _span("submit.execute", stage="execute", portal=portal_text):
+                        result = executor(
+                            plan, cfg,
+                            auto_confirm=False,
+                            dry_run=effective_dry_run,
+                        )
+                except Exception as exc:  # ⑦ 单条异常 → 失败并继续下一条
+                    error = f"执行异常:{type(exc).__name__}:{exc}"
                     _mark_state(state, entry_id, "failed", error=error)
                     failed_n += 1
                     telemetry.inc(_METRIC_FAILED)
                     results.append(
                         _result_row(
-                            entry_id, group_name, portal_text,
-                            ok=False, submitted=False, error=error,
+                            entry_id,
+                            group_name,
+                            portal_text,
+                            ok=False,
+                            submitted=False,
+                            error=error,
                         )
                     )
-                elif getattr(result, "submitted", False):
-                    # ⑥ 提交成功:状态 → submitted + 频控记账 + 审计留痕
-                    _mark_state(state, entry_id, "submitted")
-                    rate.record()
-                    _audit().log_event(
-                        _AUDIT_EVENT,
-                        entry_id=entry_id,
-                        group_name=group_name,
-                        portal=portal_text,
-                        dry_run=effective_dry_run,
-                        auto_confirm=False,
-                        index=index,
-                        total=total,
-                    )
-                    submitted_n += 1
-                    telemetry.inc(_METRIC_SUBMITTED)
-                    results.append(
-                        _result_row(
-                            entry_id, group_name, portal_text,
-                            ok=True, submitted=True, error="",
-                        )
-                    )
-                elif getattr(result, "ok", False):
-                    # 执行成功但未真实提交(典型:干跑)→ 该条跳过,不算失败
-                    _mark_state(state, entry_id, "skipped", error="干跑/未真实提交")
-                    results.append(
-                        _result_row(
-                            entry_id, group_name, portal_text,
-                            ok=True, submitted=False, error="",
-                        )
+                    logger.warning(
+                        "批量单条异常:index=%d entry=%s(%s)", index, entry_id, exc
                     )
                 else:
-                    stopped = getattr(result, "stopped_at", "") or "未知步骤"
-                    error = f"执行失败:{stopped}"
-                    _mark_state(state, entry_id, "failed", error=error)
-                    failed_n += 1
-                    telemetry.inc(_METRIC_FAILED)
-                    results.append(
-                        _result_row(
-                            entry_id, group_name, portal_text,
-                            ok=False, submitted=False, error=error,
+                    if result is None:
+                        error = "执行失败:执行器未返回任何结果"
+                        _mark_state(state, entry_id, "failed", error=error)
+                        failed_n += 1
+                        telemetry.inc(_METRIC_FAILED)
+                        results.append(
+                            _result_row(
+                                entry_id, group_name, portal_text,
+                                ok=False, submitted=False, error=error,
+                            )
                         )
-                    )
+                    elif getattr(result, "submitted", False):
+                        # ⑥ 提交成功:状态 → submitted + 频控记账 + 审计留痕
+                        _mark_state(state, entry_id, "submitted")
+                        rate.record()
+                        _audit().log_event(
+                            _AUDIT_EVENT,
+                            entry_id=entry_id,
+                            group_name=group_name,
+                            portal=portal_text,
+                            dry_run=effective_dry_run,
+                            auto_confirm=False,
+                            index=index,
+                            total=total,
+                        )
+                        submitted_n += 1
+                        telemetry.inc(_METRIC_SUBMITTED)
+                        results.append(
+                            _result_row(
+                                entry_id, group_name, portal_text,
+                                ok=True, submitted=True, error="",
+                            )
+                        )
+                    elif getattr(result, "ok", False):
+                        # 执行成功但未真实提交(典型:干跑)→ 该条跳过,不算失败
+                        _mark_state(state, entry_id, "skipped", error="干跑/未真实提交")
+                        results.append(
+                            _result_row(
+                                entry_id, group_name, portal_text,
+                                ok=True, submitted=False, error="",
+                            )
+                        )
+                    else:
+                        stopped = getattr(result, "stopped_at", "") or "未知步骤"
+                        error = f"执行失败:{stopped}"
+                        _mark_state(state, entry_id, "failed", error=error)
+                        failed_n += 1
+                        telemetry.inc(_METRIC_FAILED)
+                        results.append(
+                            _result_row(
+                                entry_id, group_name, portal_text,
+                                ok=False, submitted=False, error=error,
+                            )
+                        )
 
             # ⑧ 条间等待:仅真实模式且还有下一条(dry_run 跳过;末条后不等)
             if not effective_dry_run and index < total:

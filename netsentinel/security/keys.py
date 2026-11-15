@@ -61,12 +61,12 @@ import logging
 import os
 import pathlib
 import re
-import stat
-import subprocess
+import subprocess  # 保留:测试以 keys.subprocess 为补丁锚点注入假 icacls
 from typing import Any, Mapping
 
 from netsentinel import telemetry
 from netsentinel.contracts import Config
+from netsentinel.security._fsutil import tighten_key_file_permissions
 
 __all__ = ["get_key", "set_key", "store_key_to_keyring", "configured", "redact_keys"]
 
@@ -408,41 +408,13 @@ def get_key(provider: str, cfg: Config, *, environ: Mapping[str, str] | None = N
 def _tighten_key_file_permissions(path: pathlib.Path) -> None:
     """收紧密钥文件权限;任何失败只记日志提示,绝不抛出。
 
-    - POSIX:``os.chmod(path, 0o600)``;
-    - Windows(``os.name == 'nt'``):尝试 ``icacls`` 移除继承并仅授权当前用户。
-      输出按**字节**捕获(不传 ``text=True``),避免非 UTF-8 / GBK 控制台输出
-      触发解码错误;只看退出码,非 0 仅中文提示手动处理。
+    实现已收敛至 :func:`netsentinel.security._fsutil.tighten_key_file_permissions`
+    (原 keys / vault / bundle_sign 三份逐字拷贝合并为单一实现,本模块保留
+    同名薄包装——模块级名字不变,测试可继续 monkeypatch 本名字)。
+    语义不变:POSIX ``chmod 600``;Windows 尝试 ``icacls``(输出按字节
+    捕获,只看退出码,非 0 仅中文提示手动处理)。
     """
-    try:
-        if os.name == "nt":
-            user = os.environ.get("USERNAME") or os.environ.get("USERDOMAIN") or ""
-            grant = f"{user}:F" if user else f"{path.owner()}:F"
-            result = subprocess.run(  # noqa: S603 本地权限命令,参数受控
-                ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
-                capture_output=True,  # 字节捕获:绝不解码 icacls 输出,只看退出码
-                timeout=10,
-                check=False,
-            )
-            if result.returncode != 0:
-                logger.info(
-                    "密钥文件 %s 未能自动收紧权限(icacls 退出码 %s),"
-                    "建议手动执行:icacls \"%s\" /inheritance:r /grant:r \"%s\"",
-                    path,
-                    result.returncode,
-                    path,
-                    grant,
-                )
-            else:
-                logger.info("已通过 icacls 收紧密钥文件权限:%s", path)
-        else:
-            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
-            logger.info("已将密钥文件权限收紧为仅属主可读写(chmod 600):%s", path)
-    except Exception as exc:  # noqa: BLE001 权限收紧是建议性动作,失败不阻断
-        logger.warning(
-            "无法自动收紧密钥文件 %s 的权限(%s),建议手动限制为仅当前用户可读。",
-            path,
-            exc,
-        )
+    tighten_key_file_permissions(path, logger=logger)
 
 
 def set_key(provider: str, key: str, *, base: str = "~/.netsentinel/keys") -> str:

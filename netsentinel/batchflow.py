@@ -61,12 +61,11 @@ import importlib
 import json
 import logging
 import pathlib
-import re
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.parse import urlsplit
 
 from netsentinel import telemetry
+from netsentinel import _flowutil
 from netsentinel.contracts import Config
 
 __all__ = ["PORTAL_DEFAULT", "main", "resume_batch", "run_flow"]
@@ -94,6 +93,11 @@ _METRIC_TRACE_FAILED = "batchflow.trace_export.failed"
 
 # ---------------------------------------------------------------------------
 # 惰性导入辅助(兄弟模块并行开发中,未就位抛中文 RuntimeError)
+#
+# 交叉注释(设计说明):本函数在 __main__ / batchflow / finishflow /
+# sessionflow 四处各有一份逐字重复——**入口独立性是设计**(每个 CLI 入口
+# 零兄弟依赖、可单独运行),不做收敛;两 flow 共用的纯辅助已提取到
+# netsentinel/_flowutil.py(其内部持有自己的私有惰性导入,不经本函数)。
 # ---------------------------------------------------------------------------
 def _load(module_name: str, attr: str) -> Any:
     """惰性导入 ``module_name.attr``;ImportError/缺属性 → 中文 RuntimeError。"""
@@ -121,67 +125,6 @@ def _group_size(group: Any) -> int:
     return 1
 
 
-def _as_mapping(row: Any) -> dict[str, Any]:
-    """把批次未完条目(A113 resume 的返回行)宽容转成 dict。
-
-    兼容映射 / sqlite3.Row(有 ``keys()``)/ dataclass 与普通对象
-    (``__dict__``);完全取不到字段时返回空 dict(由调用方按缺字段报错)。
-    """
-    if isinstance(row, Mapping):
-        return dict(row)
-    keys = getattr(row, "keys", None)
-    if callable(keys):
-        try:
-            return {str(k): row[k] for k in keys()}
-        except Exception:  # noqa: BLE001 - 鸭子行取值失败按空映射处理
-            return {}
-    state = getattr(row, "__dict__", None)
-    if isinstance(state, dict):
-        return dict(state)
-    return {}
-
-
-def _merge_resumed_items(
-    rows: list[Any], ready_items: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """批次未完条目 ←→ 就绪清单 合并成 run_batch 的 items。
-
-    - 就绪条目按 ``entry_id`` 建索引;批次行优先保留自身字段,就绪条目补齐/
-      覆盖非空的 ``portal`` / ``site_url`` / ``evidence_zip`` 等执行细节;
-    - ``portal`` 双缺时补 :data:`PORTAL_DEFAULT`;
-    - 合并后仍缺 ``entry_id`` / ``group_name`` → 中文 :class:`ValueError`
-      指明条目(run_batch 前置校验的前移,报错更贴近数据来源)。
-    """
-    ready_by_id: dict[Any, dict[str, Any]] = {}
-    for item in ready_items:
-        eid = item.get("entry_id")
-        if eid is not None:
-            ready_by_id[eid] = dict(item)
-    merged: list[dict[str, Any]] = []
-    for row in rows:
-        item = _as_mapping(row)
-        base = ready_by_id.get(item.get("entry_id"), {})
-        for key, value in base.items():
-            if value not in (None, ""):
-                item[key] = value
-        item.setdefault("entry_id", base.get("entry_id"))
-        item.setdefault("group_name", base.get("group_name"))
-        if not item.get("portal"):
-            item["portal"] = PORTAL_DEFAULT
-        missing = [
-            key
-            for key in ("entry_id", "group_name", "portal")
-            if item.get(key) in (None, "")
-        ]
-        if missing:
-            raise ValueError(
-                "批次未完条目缺少必填字段:"
-                f"{'、'.join(missing)}(条目:{item or '(空)'})"
-            )
-        merged.append(item)
-    return merged
-
-
 # ---------------------------------------------------------------------------
 # ⭢ trace 收官消费(V12 接线收口,A231;手法对齐 A210 finishflow——只读参考):
 #    cfg.trace_enabled 开启时,批次收官段消费各站 intel["trace_id"]:
@@ -189,53 +132,10 @@ def _merge_resumed_items(
 #    <data_dir>/runs/<站点标识>/trace.json;(c) 批次末 drain_to_sink 长窗口
 #    转存审计 JSONL。开关关闭零行为;任何失败只中文 warning + 计数
 #    batchflow.trace_export.failed,绝不中断批次主流程。
+#
+#    trace_id_of / site_dirname 已收敛至 netsentinel/_flowutil.py
+#    (与 finishflow 共用同一实现,行为不变)。
 # ---------------------------------------------------------------------------
-def _trace_id_of(report: Any) -> str:
-    """鸭子取 ``report.intel["trace_id"]``;无 intel / 非映射 / 无键 → 空串。
-
-    trace_id 是 16-hex 非内容字段(A198 契约),不涉站点内容,可安全计数。
-    (与 A210 finishflow._trace_id_of 同一口径。)
-    """
-    intel = getattr(report, "intel", None)
-    if isinstance(intel, Mapping):
-        tid = intel.get("trace_id")
-        if isinstance(tid, str) and tid:
-            return tid
-    return ""
-
-
-def _site_dirname(url: str, report: Any) -> str:
-    """站点目录名:canonical 键优先,回退主机名,再退安全化整串(纯本地、确定)。
-
-    与 A210 finishflow._site_dirname 同一安全化口径:优先
-    ``intel.canonical.canonical_key``(项目既定站点同一性口径),模块缺席
-    时降级 ``urlsplit().hostname``;任何来源都经 ``[^0-9A-Za-z._-]`` 安全化,
-    保证跨平台可作目录名;全部解析失败回退 ``"site"``。
-    """
-    candidates = [str(url or ""), str(getattr(report, "site_url", "") or "")]
-    try:
-        canonical_key = _load("netsentinel.intel.canonical", "canonical_key")
-    except RuntimeError:
-        canonical_key = None
-    if canonical_key is not None:
-        for candidate in candidates:
-            key = str(canonical_key(candidate) or "")
-            if key:
-                return re.sub(r"[^0-9A-Za-z._-]+", "_", key)
-    for candidate in candidates:
-        try:
-            host = (urlsplit(candidate).hostname or "").strip().lower()
-        except ValueError:
-            host = ""
-        if host:
-            return re.sub(r"[^0-9A-Za-z._-]+", "_", host)
-    for candidate in candidates:
-        slug = re.sub(r"[^0-9A-Za-z._-]+", "_", candidate).strip("._-")
-        if slug:
-            return slug[:64]
-    return "site"
-
-
 def _consume_scan_traces(
     reports: Mapping[str, Any], cfg: Config
 ) -> tuple[list[str], list[str]]:
@@ -261,7 +161,7 @@ def _consume_scan_traces(
     pending: list[tuple[str, Any, str]] = []
     seen: set[str] = set()
     for url, report in dict(reports or {}).items():
-        tid = _trace_id_of(report)
+        tid = _flowutil.trace_id_of(report)
         if tid and tid not in seen:
             seen.add(tid)
             pending.append((str(url), report, tid))
@@ -282,7 +182,7 @@ def _consume_scan_traces(
     data_dir = pathlib.Path(str(getattr(cfg, "data_dir", "data") or "data"))
     written: list[str] = []
     for url, report, tid in pending:
-        out_path = data_dir / "runs" / _site_dirname(url, report) / "trace.json"
+        out_path = data_dir / "runs" / _flowutil.site_dirname(url, report) / "trace.json"
         try:
             tree = export_trace_json(tid)
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,6 +257,7 @@ def run_flow(
     grouping: Callable[..., Any] | None = None,
     queue: Any | None = None,
     packager: Callable[..., Any] | None = None,
+    resume_scan: str | None = None,
 ) -> dict[str, Any]:
     """批量总流程·前半段:加载清单 → 规划 → 扫描 → 归组入列 → 中文摘要。
 
@@ -367,13 +268,21 @@ def run_flow(
        :class:`ValueError`(原样上抛,由 CLI 转中文错误码);
     2. A107 ``plan_scan`` 规划(canonical 去重 + 指纹未变跳过;``memory``
        注入透传);
-    3. 待扫为空 → **短路返回**(不触碰扫描/归组兄弟模块),计入遥测
+    3. **站级断点续跑(V10.35)**:``cfg.scan_journal_enabled``(缺省 True)
+       时逐站结局落 :class:`~netsentinel.ops.scan_journal.ScanJournal`;
+       ``resume_scan=<批次号>`` 时把该批次已 ``done`` 的站从待扫清单剔除
+       (崩溃续跑:已完成站不重抓,在飞站重扫由 vlm_cache 幂等兜底);
+    4. 待扫为空 → **短路返回**(不触碰扫描/归组兄弟模块),计入遥测
        ``batchflow.flow.empty``;
-    4. ``scanner``(缺省 A108 ``batch_scan``,``run_scan`` / ``memory`` /
+    5. ``scanner``(缺省 A108 ``batch_scan``,``run_scan`` / ``memory`` /
        ``pool_runner`` 透传)并发扫描 → ``{"reports", "summary"}``;
-    5. ``grouping``(缺省 A108 ``group_and_enqueue``,``queue`` / ``packager``
+       **优雅退出(V10.35)**:``cfg.graceful_exit_enabled``(缺省 True)
+       时安装 SIGINT/SIGTERM 协调器,首个信号停接新站、在飞任务排空
+       后收场(摘要 ``interrupted=True`` + ``not_submitted`` 清单如实
+       登记;再按一次立即硬中断);Ctrl-C 硬中断以中文摘要退出,不重抛;
+    6. ``grouping``(缺省 A108 ``group_and_enqueue``,``queue`` / ``packager``
        透传)归组 + 合并证据 + 每组入列一条;
-    6. 打印中文摘要(合法/拒绝/待扫/跳过/组数/入列数/最大组)与
+    7. 打印中文摘要(合法/拒绝/待扫/跳过/组数/入列数/最大组)与
        "下一步"指引(TUI 逐组声明 → batchflow 续批)。
 
     红线 24/25:**本函数永不提交**——``submit`` 参数仅为契约签名兼容保留,
@@ -383,7 +292,10 @@ def run_flow(
     :return: ``{"groups": 组数, "enqueued": 入列数, "to_scan": [待扫 URL], "summary": {...}}``;
         ``cfg.trace_enabled`` 开启且扫描结果携带 trace_id 时追加
         ``"trace_ids": [批级 trace 清单]`` 与 ``"trace_json_paths": [落盘路径]``
-        (仅在实际消费到/落盘时携带,开关关闭的结果形态与旧版逐字节一致)。
+        (仅在实际消费到/落盘时携带,开关关闭的结果形态与旧版逐字节一致);
+        扫描日志开启时追加 ``"scan_batch_id"``(本批站级日志批次号,续跑
+        ``--resume-scan`` 用)与 ``"scan_journal_skipped"``(续跑剔除数,
+        仅 >0 时携带)。
     :raises ValueError: 清单加载失败(A107 中文消息)。
     :raises RuntimeError: 缺省依赖(A107/A108)未就位,中文消息指明模块。
     """
@@ -410,42 +322,106 @@ def run_flow(
     trace_ids: list[str] = []
     trace_json_paths: list[str] = []
     drained_traces = 0
+    interrupted = False
+    not_submitted_count = 0
+
+    # V10.35(P2 阶段3):站级扫描日志——开库失败只告警降级(fail-open,
+    # 批量照跑不记日志);resume_scan 给定时剔除该批次已完成站(断点续跑)
+    journal: Any = None
+    scan_batch_id: str | None = None
+    journal_skipped = 0
+    if to_scan and bool(getattr(cfg, "scan_journal_enabled", True)):
+        try:
+            from netsentinel.ops.scan_journal import (
+                ScanJournal,
+                default_journal_path,
+            )
+
+            db_path = (getattr(cfg, "scan_journal_db", "") or "").strip() or default_journal_path(
+                str(getattr(cfg, "data_dir", "data"))
+            )
+            journal = ScanJournal(db_path)
+            scan_batch_id = str(resume_scan) if resume_scan else journal.new_batch()
+            if resume_scan:
+                done = journal.done_urls(scan_batch_id)
+                before = len(to_scan)
+                to_scan = [u for u in to_scan if u not in done]
+                journal_skipped = before - len(to_scan)
+                journal.resume_skip_count(journal_skipped)
+                if journal_skipped:
+                    logger.info(
+                        "断点续跑:批次 %s 已完成 %d 站剔除,剩余 %d 站待扫",
+                        scan_batch_id, journal_skipped, len(to_scan),
+                    )
+        except Exception as exc:  # noqa: BLE001 - 日志库不可用只降级不阻断
+            logger.warning("站级扫描日志不可用,本批不记断点(不影响扫描):%s", exc)
+            journal = None
+            scan_batch_id = None
 
     if to_scan:
         scan_fn = scanner if scanner is not None else _load(
             "netsentinel.ops.batch_scan", "batch_scan"
         )
-        # V9:并发档位只在入口包一层 pool_runner(workers=io_workers);
-        # 显式 pool_runner 优先;红线 35——对外礼貌间隔与频控不受档位影响。
-        effective_pool_runner = pool_runner
-        if pool_runner is None:
-            try:
-                from netsentinel.ops.concurrency import io_workers as _io_workers
-                from netsentinel.ops import pool as _pool_mod
+        # V10.35(P2-7):优雅退出——cfg.graceful_exit_enabled(缺省 True)时
+        # 安装 SIGINT/SIGTERM 协调器;首个信号停接新站→排空在飞→正常返回
+        # (摘要带 interrupted);再次信号在处理器内抛 KeyboardInterrupt
+        # (硬退出,操作者的第二次按键即放弃等待)。scanner/pool_runner 注入
+        # = 调用方接管并发(测试语义),不注入 stop_check。
+        graceful_active = bool(getattr(cfg, "graceful_exit_enabled", True))
+        from netsentinel.ops.graceful import graceful_exit
 
-                _workers = _io_workers(cfg)
+        with graceful_exit(install_signals=graceful_active) as _gx:
+            # V9:并发档位只在入口包一层 pool_runner(workers=io_workers);
+            # 显式 pool_runner 优先;红线 35——对外礼貌间隔与频控不受档位影响。
+            effective_pool_runner = pool_runner
+            if pool_runner is None:
+                try:
+                    from netsentinel.ops.concurrency import io_workers as _io_workers
+                    from netsentinel.ops import pool as _pool_mod
 
-                def _tier_pool_runner(cfg_, items, **kw):  # noqa: ANN001
-                    kw.setdefault("workers", _workers)
-                    return _pool_mod.run_pool(cfg_, items, **kw)
+                    _workers = _io_workers(cfg)
 
-                effective_pool_runner = _tier_pool_runner
-            except Exception:  # noqa: BLE001 - 档位解析失败回退 pool 默认
-                effective_pool_runner = None
-        scan_kwargs = {
-            key: value
-            for key, value in (
-                ("run_scan", run_scan),
-                ("memory", memory),
-                ("pool_runner", effective_pool_runner),
-            )
-            if value is not None
-        }
-        with telemetry.timer("batchflow.run_flow.scan"):
-            scan_result = scan_fn(to_scan, cfg, **scan_kwargs)
+                    def _tier_pool_runner(cfg_, items, **kw):  # noqa: ANN001
+                        kw.setdefault("workers", _workers)
+                        if graceful_active:
+                            kw.setdefault("stop_check", _gx.should_stop)
+                        return _pool_mod.run_pool(cfg_, items, **kw)
+
+                    effective_pool_runner = _tier_pool_runner
+                except Exception:  # noqa: BLE001 - 档位解析失败回退 pool 默认
+                    effective_pool_runner = None
+            scan_kwargs = {
+                key: value
+                for key, value in (
+                    ("run_scan", run_scan),
+                    ("memory", memory),
+                    ("pool_runner", effective_pool_runner),
+                )
+                if value is not None
+            }
+            with telemetry.timer("batchflow.run_flow.scan"):
+                scan_result = scan_fn(to_scan, cfg, **scan_kwargs)
         reports = dict((scan_result or {}).get("reports") or {})
         errors = ((scan_result or {}).get("summary") or {}).get("errors") or []
         scan_error_count = len(errors)
+        pool_summary = (scan_result or {}).get("summary") or {}
+        interrupted = bool(pool_summary.get("interrupted"))
+        not_submitted_count = len(pool_summary.get("not_submitted") or [])
+
+        # V10.35:站级结局落账(done/failed 各一行,主键幂等;库不可用已
+        # 在开库时降级,journal 为 None 时静默跳过)
+        if journal is not None and scan_batch_id:
+            for url in (pool_summary.get("results") or {}):
+                verdict = (pool_summary.get("results") or {}).get(url, "")
+                try:
+                    journal.record(scan_batch_id, url, "done", str(verdict))
+                except Exception as exc:  # noqa: BLE001 - 单站落账失败不阻断
+                    logger.warning("扫描日志落账失败(%s):%s", url, exc)
+            for url, _err in errors or []:
+                try:
+                    journal.record(scan_batch_id, url, "failed")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("扫描日志落账失败(%s):%s", url, exc)
 
         group_fn = grouping if grouping is not None else _load(
             "netsentinel.ops.batch_scan", "group_and_enqueue"
@@ -493,6 +469,14 @@ def run_flow(
         print(f"trace 落盘 : {len(trace_json_paths)} 份(runs/<站点>/trace.json)")
     if drained_traces:
         print(f"trace 转存 : {drained_traces} 条(审计 JSONL 长窗口)")
+    if scan_batch_id:
+        tip = "崩溃续跑:python -m netsentinel.batchflow --input 同清单 --resume-scan " + scan_batch_id
+        if journal_skipped:
+            print(f"断点续跑  : 本批剔除已完成 {journal_skipped} 站(批次 {scan_batch_id})")
+        print(f"扫描批次  : {scan_batch_id}({tip})")
+    if interrupted:
+        print(f"⚠ 优雅退出 : 收到退出信号,未提交 {not_submitted_count} 站已跳过;"
+              f"已完成站与在飞站结局见上;续跑用上面的 --resume-scan 命令")
     _print_flow_next_steps()
     logger.info(
         "批量筛选流程完成:%s(合法 %d/拒绝 %d/待扫 %d/组 %d/入列 %d/trace %d/转存 %d)",
@@ -517,6 +501,19 @@ def run_flow(
         result["trace_ids"] = trace_ids
     if trace_json_paths:
         result["trace_json_paths"] = trace_json_paths
+    if scan_batch_id:
+        # V10.35:站级扫描日志批次号(断点续跑凭据;日志关闭的批次不携带,
+        # 结果形态与旧版逐字节一致)
+        result["scan_batch_id"] = scan_batch_id
+        if journal_skipped:
+            result["scan_journal_skipped"] = journal_skipped
+        if interrupted:
+            result["scan_interrupted"] = True
+    if journal is not None:
+        try:
+            journal.close()
+        except Exception:  # noqa: BLE001 - 关库失败不影响结果返回
+            pass
     return result
 
 
@@ -616,7 +613,10 @@ def resume_batch(
             )
         unfinished = list(resume_fn(batch_id) or []) if batch_id is not None else []
         if unfinished:
-            items = _merge_resumed_items(unfinished, ready_items)
+            items = _flowutil.merge_resumed_items(
+                unfinished, ready_items,
+                portal_default=PORTAL_DEFAULT, require_fields=True,
+            )
             bid = batch_id
             telemetry.inc(_METRIC_RESUME_CONTINUE)
             print(f"续批批次 {bid}:未完条目 {len(items)} 条(就绪清单 {len(ready_items)} 条)")
@@ -763,6 +763,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "真实执行需同时给 --exec"
         ),
     )
+    parser.add_argument(
+        "--resume-scan",
+        default=None,
+        metavar="扫描批次号",
+        help=(
+            "筛选流程断点续跑:站级扫描日志批次号(如 scan-20261110T1415),"
+            "该批次已完成的站在本轮直接跳过(与 --input 同用;"
+            "批次号见上一轮摘要的「扫描批次」行)"
+        ),
+    )
     return parser
 
 
@@ -792,6 +802,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.input and args.resume is not None:
         print("错误:--input(筛选流程)与 --resume(续批)互斥,请分开执行")
         return 2
+    if args.resume_scan and not args.input:
+        print("错误:--resume-scan 仅在 --input 筛选流程下有效(断点续跑跳过已完成站)")
+        return 2
     if not args.input and args.resume is None:
         print("错误:需要 --input 批量清单(筛选流程)或 --resume 批次号(续批)之一")
         return 2
@@ -818,7 +831,12 @@ def main(argv: list[str] | None = None) -> int:
             # CLI 强制显式:--exec → dry_run=False(真实);否则恒 dry_run=True
             resume_batch(args.resume, cfg, dry_run=not args.exec)
         else:
-            run_flow(args.input, cfg, dry_run=not args.exec)
+            run_flow(args.input, cfg, dry_run=not args.exec, resume_scan=args.resume_scan)
+    except KeyboardInterrupt:
+        # V10.35:优雅退出后再次硬中断(第二次信号)——已完成站结局已落
+        # 扫描日志,重跑 --resume-scan <批次号> 即续
+        print("已硬中断(第二次退出信号):已完成站已记入扫描日志,可用 --resume-scan 续跑")
+        return 0
     except ValueError as exc:
         print(f"错误:{exc}")
         return 2

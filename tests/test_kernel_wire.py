@@ -2061,12 +2061,15 @@ def test_resolve_gangs_community_mirror_downweight_math() -> None:
     mirror_weight_factor,阈值按**有效权重**判定(严格小于才剔除)——
     0.8 镜像边在缺省 factor 0.5 下有效权重恰 0.4:
 
-    - 阈值 0.5:0.4 < 0.5 → 镜像边全部剔除,B 团散为单点;
+    - 阈值 0.5:0.4 < 0.5 → 镜像边全部剔除,B 团散为单点(A 团为
+      shared_image 0.9 强团,不受镜像降权影响,照常成团);
     - 阈值恰 0.4:0.4 < 0.4 不成立 → 保留,B 团照常成团(边界为 >=);
-    - 阈值 0.4000001(刚过有效权重)→ 剔除,全散;
-    - factor=1.0:有效权重 0.8,A / B 两团各自成团(两团并存时全局
-      2m 足够,两团均成团);阈值刚过 0.8 → 又全散——证明 factor 只乘
-      一次、有效权重恰为 0.8。
+    - 阈值 0.4000001(刚过有效权重)→ 镜像边剔除,B 团散、A 团保持;
+    - factor=1.0:有效权重 0.8,A / B 两团各自成团;阈值刚过 0.8 →
+      B 团又散(A 团仍在)——证明 factor 只乘一次、有效权重恰为 0.8。
+
+    V10.20 注: Louvain 模块度内部项因子 2 修复前,A 团(0.9 权 K4)也
+    被错误拆散;修复后强团恢复成团,以下预期为标准模块度行为。
     """
     edges = _mirror_gang_edges()
     a_team = [f"site:a{i}" for i in range(4)]
@@ -2078,19 +2081,21 @@ def test_resolve_gangs_community_mirror_downweight_math() -> None:
     ) == [a_team, b_team]
     # 缺省 factor 0.5:有效权重 0.8 × 0.5 = 0.4 < 0.5 → 镜像边全部剔除
     assert resolve_gangs(edges, mode="community", weight_threshold=0.5) == [
-        [n] for n in sorted(a_team + b_team)
-    ]
+        a_team
+    ] + [[n] for n in b_team]
     # 边界锁定(缺省 factor):阈值 == 有效权重 0.4 → 保留(B 团成团);
-    # 刚过 0.4 → 剔除(全散)。两侧唯一差异就是乘法后的有效权重。
+    # 刚过 0.4 → 剔除(B 团散)。两侧唯一差异就是乘法后的有效权重。
     kept = resolve_gangs(edges, mode="community", weight_threshold=0.4)
     assert _group_of(kept, "site:b0") == b_team  # 0.4 ≥ 0.4:严格 < 才剔除
     dropped = resolve_gangs(edges, mode="community", weight_threshold=0.4000001)
-    assert all(len(g) == 1 for g in dropped)  # 0.4 < 0.4000001 → 剔除
+    assert _group_of(dropped, "site:a0") == a_team  # A 团不受镜像降权影响
+    assert all(len(g) == 1 for g in dropped if g[0].startswith("site:b"))
     # 边界锁定(factor=1.0):有效权重恰 0.8,刚过即剔除
     dropped_full = resolve_gangs(
         edges, mode="community", weight_threshold=0.8000001, mirror_weight_factor=1.0
     )
-    assert all(len(g) == 1 for g in dropped_full)
+    assert _group_of(dropped_full, "site:a0") == a_team
+    assert all(len(g) == 1 for g in dropped_full if g[0].startswith("site:b"))
     # 交叉验证:mirror factor 不改变其他种类的语义(shared_image 0.9 团
     # 在 factor=0.5 / 1.0 下均不受影响——上式 [a_team, b_team] 已含)
 
@@ -2110,12 +2115,13 @@ def test_resolve_gangs_from_config_mirror_switches(tmp_path) -> None:
     cfg.gang_mirror_in_connectivity = True  # 显式开启才纳入(B 团成团)
     assert resolve_gangs_from_config(edges, cfg) == [a_team, b_team]
 
-    # community 模式:缺省半权(0.8 × 0.5 = 0.4 < 0.5 剔除)
+    # community 模式:缺省半权(0.8 × 0.5 = 0.4 < 0.5 剔除;A 团 0.9
+    # 强团不受影响照常成团——V10.20 Louvain 因子 2 修复后的标准行为)
     cfg2 = _graph_cfg(tmp_path / "community")
     cfg2.gang_mode = "community"
     cfg2.gang_weight_threshold = 0.5
     assert resolve_gangs_from_config(edges, cfg2) == [
-        [n] for n in sorted(a_team + b_team)
-    ]
+        a_team
+    ] + [[n] for n in b_team]
     cfg2.gang_mirror_weight_factor = 1.0  # 显式提权 → 0.8 ≥ 0.5 保留
     assert resolve_gangs_from_config(edges, cfg2) == [a_team, b_team]

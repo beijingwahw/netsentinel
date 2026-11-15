@@ -306,10 +306,13 @@ def _render_images(report_dict: dict | None, base: Path | None) -> str:
             continue
         size = st.st_size
         b64 = base64.b64encode(data).decode("ascii")
+        # 文件名转义一次,alt 与 figcaption 共用(同一值二次 escape 消重;
+        # 输出与逐处转义逐字节一致)。base64 与文件读取仍各一次(V5 口径)。
+        name_html = _esc(path.name)
         figures.append(
             f'<figure class="ev">'
-            f'<img src="data:{_mime_for(path)};base64,{b64}" alt="{_esc(path.name)}">'
-            f"<figcaption>{_esc(path.name)}({size} 字节)</figcaption></figure>"
+            f'<img src="data:{_mime_for(path)};base64,{b64}" alt="{name_html}">'
+            f"<figcaption>{name_html}({size} 字节)</figcaption></figure>"
         )
     parts: list[str] = []
     if figures:
@@ -401,19 +404,21 @@ def render_report(
     # ---- 区块四:证据图片 ----
     images_html = _render_images(report, base)
 
+    # 抬头转义一次,<title> 与 <h1> 共用(重复 escape 消重,输出不变)。
+    title_html = _esc(DOC_TITLE)
     doc = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(DOC_TITLE)}</title>
+<title>{title_html}</title>
 <style>
 {_CSS}
 </style>
 </head>
 <body>
 <div class="sheet">
-  <h1>{_esc(DOC_TITLE)}</h1>
+  <h1>{title_html}</h1>
   <p class="doc-meta">净网哨兵 NetSentinel · 离线生成 · 仅供人工核对与归档</p>
 
   <h2>一、基本信息</h2>

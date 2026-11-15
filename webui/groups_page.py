@@ -52,6 +52,14 @@ except ImportError:  # pragma: no cover - 取决于运行环境
     st = None  # type: ignore[assignment]
     _HAS_ST = False
 
+# ---------------------------------------------------------------------------
+# 共享标签口径(webui/_labels.py 单一权威定义;双路导入兼容脚本直跑)
+# ---------------------------------------------------------------------------
+try:
+    from webui._labels import VERDICT_CN
+except ImportError:  # streamlit run webui/groups_page.py 时 sys.path[0]=webui/
+    from _labels import VERDICT_CN  # type: ignore[no-redef]
+
 __all__ = [
     "VERDICT_CN",
     "PORTAL_CN",
@@ -59,6 +67,8 @@ __all__ = [
     "BADGE_UNATTESTED",
     "group_rows",
     "attest_badge",
+    "attest_key",
+    "group_labels",
     "batch_preview",
     "portal_cn",
     "render",
@@ -69,12 +79,9 @@ __all__ = [
 # 纯逻辑层(无 streamlit 依赖;兄弟模块一律函数内惰性导入)
 # ===========================================================================
 
-#: 判定档位 → 中文(与 netsentinel.__main__ 的 _VERDICT_CN 同口径)。
-VERDICT_CN: dict[str, str] = {
-    "clean": "无风险",
-    "suspect": "疑似",
-    "nsfw": "高置信色情",
-}
+# 判定档位 → 中文:口径统一取顶部导入的 webui._labels.VERDICT_CN
+# (A233 起全站单一权威:clean=未见违规 / suspect=疑似 / nsfw=高置信;
+# 本页历史"无风险 / 高置信色情"措辞已随全站统一,常量名不变对外兼容)。
 
 #: 举报门户标识 → 中文展示名(12377 本身即号码,原样展示)。
 PORTAL_CN: dict[str, str] = {
@@ -152,7 +159,7 @@ def group_rows(groups: list | None, attested: set[str] | None = None) -> list[di
         ...                       aliases=["a.com", "www.a.com"],
         ...                       agg_max=0.876, verdict="nsfw")])
         [{'name': 'a.com', 'entries': 2, 'sites': 1, 'aliases': 2,
-          'agg_max': 0.88, 'verdict': '高置信色情', 'attested': False}]
+          'agg_max': 0.88, 'verdict': '高置信', 'attested': False}]
     """
     names = attested or set()
     rows: list[dict] = []
@@ -252,6 +259,54 @@ def portal_cn(portal: Any) -> str:
     return PORTAL_CN.get(text, text)
 
 
+def attest_key(kind: str, group_label: str) -> str:
+    """组详情声明区控件 key(V10.20 形式化;纯逻辑层)。
+
+    页签②每次只渲染**选中**的那一个案件组;kind ∈ reviewer / confirm /
+    attest(审核人姓名 / 声明确认勾选 / 声明按钮)。组标签是 selectbox 的
+    值(同名组经 :func:`group_labels` 加序号后缀后唯一)。唯一性
+    由 tests/test_webui_key_audit.py 锁定。
+
+    示例::
+
+        >>> attest_key("attest", "a.com")
+        'gp_attest_a.com'
+    """
+    return f"gp_{kind}_{group_label}"
+
+
+def group_labels(groups: list | None) -> list[tuple[str, str]]:
+    """组列表 → ``(选择器标签, 真实组名)`` 对列表(V10.20 修复;纯逻辑层)。
+
+    同名组(如多个解析失败 URL 的空名组,见
+    ``intel.case_group.group_entries`` 的 ``raw::`` 兜底)此前被组详情页的
+    ``{label: group}`` 字典去重"吞组"——后者覆盖前者,排在前面的组无法被
+    选中与声明。本函数给同名组追加 ``(第N组)`` 后缀保证标签唯一;
+    **后缀仅用于选择器展示**,声明的组名键仍用真实 name(与
+    ``batch_review.ready_entries`` 的按名匹配口径一致)。空名组的真实名
+    为空串(UI 拒绝空名声明)。
+
+    示例::
+
+        >>> group_labels([SimpleNamespace(name="a.com"),
+        ...               SimpleNamespace(name="a.com")])
+        [('a.com', 'a.com'), ('a.com(第2组)', 'a.com')]
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for group in groups or []:
+        name = str(_field(group, "name", "") or "")
+        base = name or "(未命名)"
+        label = base
+        n = 2
+        while label in seen:
+            label = f"{base}(第{n}组)"
+            n += 1
+        seen.add(label)
+        out.append((label, name))
+    return out
+
+
 # ===========================================================================
 # UI 层(以下代码仅在 streamlit 运行时执行;兄弟模块一律函数内惰性导入)
 # ===========================================================================
@@ -275,6 +330,14 @@ _ATTEST_TEXT = "我已逐站人工核实该组全部站点 URL 与证据包,同�
 
 #: 重建分组时最多回读证据包 manifest 的条数(最近优先,IO 保护)。
 _MAX_MANIFEST_ENTRIES: int = 100
+
+#: 分组总表最多渲染的行数(V10.18 大列表保护:纯展示层上限,指标卡
+#: 仍按全量 groups 计算,超出部分提示用组详情逐组查看)。
+_MAX_GROUP_ROWS_SHOWN: int = 50
+
+#: 组详情页各清单(URL / 证据包路径)最多逐条渲染的行数(纯展示层上限,
+#: 标题里的总数与声明落库的条数仍取全量 entry_ids / site_urls)。
+_MAX_DETAIL_LINES_SHOWN: int = 100
 
 
 def _agg_proxies(db_path: str, entries: list) -> dict[int, Any]:
@@ -362,6 +425,12 @@ def _render_overview(groups: list, attested: set[str]) -> None:
     cols[1].metric("已声明组", n_attested)
     cols[2].metric("未声明组", len(rows) - n_attested)
     cols[3].metric("涉及条目", sum(r["entries"] for r in rows))
+    shown_rows = rows[:_MAX_GROUP_ROWS_SHOWN]
+    if len(shown_rows) < len(rows):
+        st.caption(
+            f"为避免页面过重,总表仅展示前 {_MAX_GROUP_ROWS_SHOWN} 组"
+            f"(共 {len(rows)} 组;可在「组详情」页签逐组查看与声明)。"
+        )
     st.table(
         [
             {
@@ -373,7 +442,7 @@ def _render_overview(groups: list, attested: set[str]) -> None:
                 "判定": r["verdict"],
                 "声明状态": attest_badge(r["attested"]),
             }
-            for r in rows
+            for r in shown_rows
         ]
     )
     st.caption(
@@ -389,16 +458,27 @@ def _render_detail(groups: list, entries: list, review: Any) -> None:
     if not groups:
         st.info("暂无案件分组,请先在「分组总表」确认分组已生成。")
         return
-    options = {str(g.name or "(未命名)"): g for g in groups}
+    # V10.20:同名组(如多个解析失败 URL 的空名组)各自成组但 name 相同,
+    # dict 按 label 去重会"吞组"——group_labels 给同名组加序号后缀;后缀仅
+    # 用于选择器区分展示,声明的组名键仍用真实 name(与 ready_entries
+    # 的按名匹配口径一致,见 batch_review.resolve_group_name)。
+    pairs = group_labels(groups)
+    options = {label: g for (label, _name), g in zip(pairs, groups)}
     label = st.selectbox("选择案件组", list(options))
     group = options[label]
+    group_name = dict(pairs)[label]
     entry_ids = list(_field(group, "entry_ids", []) or [])
     site_urls = list(_field(group, "site_urls", []) or [])
     aliases = list(_field(group, "aliases", []) or [])
 
     st.markdown(f"**站点 URL({len(site_urls)} 条)**")
-    for url in site_urls:
+    for url in site_urls[:_MAX_DETAIL_LINES_SHOWN]:
         st.markdown(f"- `{url}`")
+    if len(site_urls) > _MAX_DETAIL_LINES_SHOWN:
+        st.caption(
+            f"另有 {len(site_urls) - _MAX_DETAIL_LINES_SHOWN} 条 URL 未逐条展示"
+            f"(共 {len(site_urls)} 条);请用侧栏数据目录下的队列库核对全量。"
+        )
     st.caption(
         f"别名域({len(aliases)} 个):{('、'.join(aliases)) if aliases else '(无)'}"
     )
@@ -408,8 +488,13 @@ def _render_detail(groups: list, entries: list, review: Any) -> None:
         for e in entries
     }
     st.markdown(f"**证据包路径({len(entry_ids)} 条,请逐站人工核验)**")
-    for eid in entry_ids:
+    for eid in entry_ids[:_MAX_DETAIL_LINES_SHOWN]:
         st.markdown(f"- 条目 #{eid}:`{evidence_map.get(eid) or '(尚未打包)'}`")
+    if len(entry_ids) > _MAX_DETAIL_LINES_SHOWN:
+        st.caption(
+            f"另有 {len(entry_ids) - _MAX_DETAIL_LINES_SHOWN} 条证据包路径未逐条展示"
+            f"(共 {len(entry_ids)} 条);声明与批量队列仍按全量 {len(entry_ids)} 条计。"
+        )
     st.caption(
         "请逐条打开证据包,人工核验 URL 与页面截图是否对应、证据是否真实完整;"
         "核验完成前不得声明,更不得进入批量队列(红线 24/25)。"
@@ -422,33 +507,45 @@ def _render_detail(groups: list, entries: list, review: Any) -> None:
     # ---- 批量确认声明(红线 25:勾选自述 + 落库留痕)----
     st.divider()
     st.markdown("**批量确认声明(留痕)**")
-    reviewer = st.text_input("审核人姓名", value="", key=f"gp_reviewer_{label}")
+    # V10.20:声明落库后经 rerun 即时刷新本组声明状态与总表徽章;
+    # 结果文案用 flash 暂存,本轮 rerun 后回显、随即清除。
+    flash = st.session_state.pop("_gp_flash", None)
+    if flash:
+        st.success(flash)
+    reviewer = st.text_input("审核人姓名", value="", key=attest_key("reviewer", label))
     confirmed = st.checkbox(
         _CONFIRM_LABEL,
-        key=f"gp_confirm_{label}",
+        key=attest_key("confirm", label),
         help="勾选即自述:已逐站人工核验本组全部 URL 与证据包(声明文本将入台账留痕)。",
     )
     if st.button(
         "写入批量声明(留痕)",
-        key=f"gp_attest_{label}",
+        key=attest_key("attest", label),
         type="primary",
         disabled=not confirmed,
     ):
         name = reviewer.strip()
         if not name:
             st.warning("请填写审核人姓名(每份批量声明必须留痕审核人)。")
+        elif not group_name:
+            st.warning(
+                "该组无规范组名(站点 URL 解析失败)——空组名声明无法与批量"
+                "门控按名匹配,请先修正条目 URL 后再声明。"
+            )
         else:
             try:
                 att = review.attest(
-                    label, items=len(entry_ids), reviewer=name, text=_ATTEST_TEXT
+                    group_name, items=len(entry_ids), reviewer=name, text=_ATTEST_TEXT
                 )
             except ValueError as exc:
                 st.warning(f"{exc}")
             else:
-                st.success(
+                # V10.20:rerun 即时刷新声明状态与总表徽章;文案经 flash 暂存回显。
+                st.session_state["_gp_flash"] = (
                     f"声明已留痕:组「{att.group_name}」/ {att.items} 条 /"
                     f" 审核人 {att.reviewer} / {att.ts};本页面仍不执行任何提交。"
                 )
+                st.rerun()
     st.caption(
         "声明只完成核验留痕(组名/条数/审核人入台账);举报提交须在 CLI/TUI "
         "经 --exec 逐条人工门执行(红线 24)。"
@@ -578,4 +675,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    # V10.20(SystemExit 收尾修复,同 webui/app.py):streamlit 脚本线程内
+    # 不抛 SystemExit(BaseException 会杀死脚本线程,AppTest 通道失效);
+    # 仅真直跑才转进程退出码(保留缺依赖提示退出码 1 契约)。
+    _in_script_thread = False
+    if _HAS_ST:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+            _in_script_thread = get_script_run_ctx() is not None
+        except Exception:  # noqa: BLE001 - 内部 API 缺席按直跑处理
+            _in_script_thread = False
+    if not _in_script_thread:
+        raise SystemExit(_exit_code)

@@ -39,8 +39,9 @@ class TestPermanentPath:
         assert "张三" in content and "13800001234" in content
 
     def test_setup_required_repeats(self, isolated_home):
-        # 姓名为空会重复询问
-        stdin = io.StringIO("\n张三\n13800001234\n\n\n\n\n\n")
+        # 姓名为空会重复询问(V10.20:注入流必须供足全部提示行——
+        # 读尽即 EOF 取消,不再把 EOF 静默当空输入)
+        stdin = io.StringIO("\n张三\n13800001234\n\n\n\n\n\n\n")
         stdout = io.StringIO()
         pf.setup_interactive(stdin=stdin, stdout=stdout)
         out = stdout.getvalue()
@@ -100,11 +101,41 @@ class TestPermanentPath:
         assert p.reporter_name == "旧名" and p.reporter_phone == "13000000001"
 
     def test_validation_rejects_bad_phone(self, isolated_home):
-        stdin = io.StringIO("张三\nabc\n13800001234\n\n\n\n\n\n")
+        # V10.20:电话校验重试多吃一行,注入流相应补一行(EOF 即取消)
+        stdin = io.StringIO("张三\nabc\n13800001234\n\n\n\n\n\n\n")
         stdout = io.StringIO()
         pf.setup_interactive(stdin=stdin, stdout=stdout)
         p = pf.load_profile(Config())
         assert p.reporter_phone == "13800001234"  # 重试后正确
+
+    def test_v1020_setup_eof_cancels_without_crash(self, isolated_home, capsys):
+        """V10.20:注入流读尽 → EOFError(供 main 收敛),不再静默当空输入。"""
+        stdin = io.StringIO("张三\n")  # 只够姓名,第二个提示(必填电话)即 EOF
+        with pytest.raises(EOFError):
+            pf.setup_interactive(stdin=stdin, stdout=io.StringIO())
+
+    def test_v1020_main_setup_eof_returns_one_chinese(
+        self, isolated_home, capsys, monkeypatch
+    ):
+        """V10.20:main 收敛 EOF——退出码 1 + 中文取消提示,永久模板零改动。"""
+        def _boom():
+            raise EOFError
+
+        monkeypatch.setattr(pf, "setup_interactive", _boom)
+        assert pf.main(["setup"]) == 1
+        out = capsys.readouterr().out
+        assert "输入中断" in out and "未改动" in out
+
+    def test_v1020_main_setup_keyboard_interrupt_returns_130(
+        self, isolated_home, capsys, monkeypatch
+    ):
+        """V10.20:Ctrl+C 取消——退出码 130 + 中文提示(模板零改动)。"""
+        def _boom():
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(pf, "setup_interactive", _boom)
+        assert pf.main(["setup"]) == 130
+        assert "已取消" in capsys.readouterr().out
 
     def test_redline_masked_never_full(self, isolated_home):
         """红线 39:masked() 绝不输出完整敏感字段。"""

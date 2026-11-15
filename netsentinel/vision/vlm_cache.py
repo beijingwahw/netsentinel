@@ -40,7 +40,8 @@ import threading
 from pathlib import Path
 from typing import Iterable
 
-from netsentinel import telemetry
+from netsentinel import telemetry, timesource
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 __all__ = ["VlmBudgetExceeded", "VlmCache", "DEFAULT_DAILY_LIMIT"]
 
@@ -51,9 +52,6 @@ TTL_DAYS = 30
 
 #: 每日调用预算缺省值(可被 cfg.vlm_daily_budget 覆盖)
 DEFAULT_DAILY_LIMIT = 200
-
-#: sqlite 忙等上限(毫秒):跨进程写冲突时等待而非立刻报 SQLITE_BUSY
-_BUSY_TIMEOUT_MS = 5000
 
 #: get_many 单条 SELECT 的最大键数(行值 IN 参数 = 3 × 键数,留出旧版 sqlite 999 参数上限余量)
 _SELECT_CHUNK = 256
@@ -73,7 +71,13 @@ class VlmBudgetExceeded(RuntimeError):
 
 
 def _now_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+    """当前本地时区 ISO 时间戳(秒级;V10.24 收编经 :mod:`netsentinel.timesource`)。
+
+    原 aware 惯用式 ``datetime.now(timezone.utc).astimezone().isoformat(
+    timespec="seconds")`` 与 ``timesource.now_iso()`` 逐字符等价
+    (timesource 等价性承诺的缺省形态)。
+    """
+    return timesource.now_iso()
 
 
 class VlmCache:
@@ -133,11 +137,10 @@ class VlmCache:
             return self._open_and_init(path)
 
     def _open_and_init(self, path: Path) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(path), check_same_thread=False)
+        # V10.21:连接统一经 storage.kernel.connect 工厂(全仓唯一
+        # sqlite3.connect 入口);V5 口径 WAL + 忙等 5s 由工厂内置,不变。
+        conn = sqlite_connect(str(path))
         try:
-            # V5:一律 WAL + 忙等 5s(读写并发 / 跨进程锁等待)
-            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(self._CREATE_CACHE)
             conn.execute(self._CREATE_USAGE)
             conn.commit()
@@ -162,7 +165,17 @@ class VlmCache:
             created = _dt.datetime.fromisoformat(created_at)
         except ValueError:
             return False
-        return (_dt.datetime.now(created.tzinfo) - created).days >= TTL_DAYS
+        # V10.24 收编:原式 ``_dt.datetime.now(created.tzinfo) - created`` 是
+        # "与 created 同时区取 now"的双态式——aware created 时它与
+        # timesource.utc_now() 为同一瞬间(aware 相减只看绝对时刻,时区不影响
+        # 差值);naive created 时 ``now(None)`` ≡ ``datetime.now()`` ≡
+        # timesource.now_naive_local()。两分支逐语义等价,取时全走单源。
+        now = (
+            timesource.utc_now()
+            if created.tzinfo is not None
+            else timesource.now_naive_local()
+        )
+        return (now - created).days >= TTL_DAYS
 
     @staticmethod
     def _load_payload(payload_raw: str) -> dict | None:

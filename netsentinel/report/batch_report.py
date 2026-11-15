@@ -4,8 +4,10 @@
 一批举报(A112 ``run_batch`` 顺序逐条执行)干完之后,把批次摘要渲染成
 **单文件 HTML 结案报告(人工核对稿)**供运营者核对、归档。与
 ``report.html_report``(单站举报材料)同属公文风格,但**独立实现、
-互不依赖**;本模块只用 Python 标准库(html / pathlib / datetime),
-产物为零外部依赖的离线 HTML(内联 CSS)。
+互不依赖**;本模块只用 Python 标准库(html / pathlib)与基座级时间源
+:mod:`netsentinel.timesource`(V10.21 席位2 时间源单源化,生成时间
+strftime 改经 ``timesource.now_local()``,墙钟输出与原 naive
+``datetime.now()`` 逐字节等价),产物为零外部依赖的离线 HTML(内联 CSS)。
 
 核心入口 :func:`render_batch_report`:
 
@@ -47,9 +49,10 @@ from __future__ import annotations
 import html as _html
 import logging
 from collections.abc import Mapping
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from netsentinel import timesource
 
 __all__ = ["render_batch_report"]
 
@@ -267,7 +270,7 @@ def render_batch_report(batch_id: Any, summary: dict[str, Any], out_path: str) -
         )
 
     batch_text = str(batch_id)
-    generated_at = _text(summary.get("generated_at")) if summary.get("generated_at") else datetime.now().strftime(_TS_FORMAT)
+    generated_at = _text(summary.get("generated_at")) if summary.get("generated_at") else timesource.now_local().strftime(_TS_FORMAT)
 
     # ---- 区块一:批次信息 ----
     note = str(summary.get("note") or "").strip()

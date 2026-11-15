@@ -98,14 +98,28 @@ class FakeTransport:
 
 
 class FakeResponse:
-    """monkeypatch urlopen 时使用的假响应对象(上下文管理器 + read/status)。"""
+    """monkeypatch urlopen 时使用的假响应对象(上下文管理器 + read/status)。
+
+    read 接受可选 size 实参(与真实 http.client 响应语义一致,V10.18 起
+    glm_adapter 响应体读取走 vlm_client._read_capped 分块路径)。
+    """
 
     def __init__(self, body: str, status: int = 200) -> None:
         self._body = body.encode("utf-8")
-        self.status = status
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            return self._body
+        data, self._body = self._body[:size], self._body[size:]
+        return data
+
+    @property
+    def status(self) -> int:
+        return self._status
+
+    @status.setter
+    def status(self, value: int) -> None:
+        self._status = int(value)
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -384,6 +398,24 @@ def test_default_transport_httperror_converted_to_status(monkeypatch):
     client = GlmVlmClient(make_cfg())
     assert client.chat_json([{"role": "user", "content": "hi"}]) == {"nsfw_prob": 0.2}
     assert client.model == "glm-4.5v-flash"
+
+
+def test_default_transport_response_over_limit_raises_chinese(monkeypatch):
+    """(V10.18)成功响应体超过大小上限:分块读取中止并抛中文 RuntimeError。
+
+    与 vlm_client 主传输层同口径(复用 _read_capped);异常消息只报上限
+    不回显内容。
+    """
+
+    huge = FakeResponse('{"padding": "' + "x" * (12 * 1024 * 1024) + '"}')
+
+    def fake_urlopen(request, timeout=None):
+        return huge
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = GlmVlmClient(make_cfg())
+    with pytest.raises(RuntimeError, match="响应体超过大小上限"):
+        client.chat_json([{"role": "user", "content": "hi"}])
 
 
 # ---------------------------------------------------------------------------

@@ -85,26 +85,43 @@ V14 接线残余批配置收录(``bayes_reliability`` / ``bayes_half_life`` 升�
   消费方(orchestrator 贝叶斯重放)getattr 读取路径同名字段无缝命中,
   缺省语义零变化。
 
+V10.21 数据目录环境覆盖全链路接入(``NETSENTINEL_DATA_DIR``):
+
+- V10.20 发现该环境变量只有 webui 认(其 ``apply_data_dir`` 在 UI 层覆盖),
+  核心 CLI/REST 完全不认——数据目录退化为 CWD 相对默认 ``./data``;
+- V10.21 起 :func:`load_config` 统一接入:环境变量设置且非空白时,
+  按默认目录布局整体迁移 ``data_dir`` 及其派生子路径(与 webui 语义
+  逐字段一致,见 :func:`apply_data_dir`);CLI(``netsentinel scan`` 等)、
+  REST(service)与 webui 三条入口从此同认一个变量;
+- **优先级:环境变量 > config.yaml 文件值 > 字段默认**(与 webui 现状
+  ``apply_data_dir(load_config())`` 一致——webui 先加载文件再覆盖,即 env
+  胜出);环境变量未设置/空串/纯空白时行为与升级前**逐字节一致**;
+- webui 不改:它继续用自己的 ``apply_data_dir`` 副本;``load_config`` 已
+  覆盖后再叠加 webui 的覆盖是幂等操作(同一 root 派生同一组路径)。
+
 用法示例::
 
     from netsentinel.config import load_config, save_config
 
     cfg = load_config("config.yaml")     # 文件不存在则返回纯默认 Config
-    save_config(cfg, "out/config.yaml")  # 自动创建父目录
+    save_config(cfg, "out/config.yaml")  # 自动创建 out/ 目录
 """
 from __future__ import annotations
 
 import dataclasses
 import logging
 import math
+import os
 import pathlib
-from typing import Any
+from typing import Any, Mapping
 
 from netsentinel import telemetry
 from netsentinel.contracts import Config
 
 __all__ = [
+    "DATA_DIR_ENV",
     "DEFAULT_CONFIG_FILENAME",
+    "apply_data_dir",
     "load_config",
     "save_config",
 ]
@@ -135,6 +152,8 @@ _FLOAT_FIELDS = frozenset({
     "gang_template_weight_factor",
     "gang_resolution",
     "abstain_threshold",
+    # V10.35(P2-8)通知重试基础退避秒(指数翻倍;仅 notify_retry_max>0 生效)
+    "notify_retry_backoff_s",
 })
 _INT_FIELDS = frozenset({
     "min_nsw_images",
@@ -159,8 +178,19 @@ _INT_FIELDS = frozenset({
     "agents_max_workers",
     "setup_port",
     "cpu_reserve",
+    # V10.29(P0-2)受界并发送审:0=自动档 / 1=串行 / 2~16 显式;
+    # provider_rpm 0=不限速(A74 令牌桶,并发下的礼貌护栏)。
+    "vlm_parallel_workers",
+    "provider_rpm",
+    "vlm_health_ttl_s",
+    "vlm_neardup_threshold_bits",
+    # V10.35(P2-8)通知有界重试:0=单发不重试(V2 缺省红线);>0=指数退避。
+    "notify_retry_max",
 })
 _BOOL_FIELDS = frozenset({
+    "vlm_budget_precheck",  # V10.30 P1-5 扫描预检总开关
+    "scan_pipeline_overlap",  # V10.31 P1-3 站内流水线重叠
+    "vlm_neardup_dedup",  # V10.32 P1-4 同站近重复拦下
     "respect_robots",
     "allow_network",
     "human_gate_required",
@@ -191,6 +221,9 @@ _BOOL_FIELDS = frozenset({
     "dynamic_ttl",
     # V14:接线残余批收录(A223 贝叶斯回流开关升格;默认 False = 现状等权)
     "bayes_reliability",
+    # V10.35(P2-7/9)无人值守韧性:优雅退出总开关 / 站级扫描日志开关
+    "graceful_exit_enabled",
+    "scan_journal_enabled",
 })
 _LIST_STR_FIELDS = frozenset(
     {"ensemble_members", "glm_models_fallback", "vlm_fallback_chain", "local_probe_ports"}
@@ -495,6 +528,53 @@ def _validate(cfg: Config) -> None:
     raise ValueError("\n".join(message for _, message in errors) + f"\n校验失败字段分组:{summary}")
 
 
+#: 数据目录覆盖环境变量名(字面量与 webui/app.py 的 ``DATA_DIR_ENV`` 一致;
+#: 本模块属核心配置层,刻意不 import webui——零内部依赖分层,webui 侧改名时
+#: 以其测试 test_webui_smoke 的断言为准,此处须人工同步,同 _GUARD_FAMILIES 惯例)。
+DATA_DIR_ENV: str = "NETSENTINEL_DATA_DIR"
+
+#: 环境覆盖时随默认目录布局一并迁移的派生子路径(与 webui 语义逐字段一致)。
+#: 注意 ``phash_db`` / ``graph_db`` / ``discovery_cache_db`` 等**不**在其中
+#: ——webui 现状就不迁移它们,本席对齐口径不改清单。
+_DATA_DIR_DERIVED: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("evidence_dir", ("evidence",)),
+    ("db_path", ("review_queue.db",)),
+    ("audit_path", ("audit.jsonl",)),
+    ("log_path", ("logs", "netsentinel.log")),
+    ("vlm_cache_db", ("vlm_cache.db",)),
+)
+
+
+def apply_data_dir(cfg: Config, env: Mapping[str, str] | None = None) -> Config:
+    """按 ``NETSENTINEL_DATA_DIR`` 环境变量覆盖数据路径(就地更新并返回 cfg)。
+
+    V10.21 抽出的公共纯函数:语义与 webui/app.py 的同名 ``apply_data_dir``
+    完全一致(webui 不改,继续用自己的副本;两处并行,语义一致即可)——
+
+    - 未设置环境变量、空串或纯空白时**原样返回**(缺省行为逐字节不变);
+    - 设置后 ``cfg.data_dir`` 置为该值,并按默认目录布局整体重派生子路径:
+      ``<root>/{evidence, review_queue.db, audit.jsonl,
+      logs/netsentinel.log, vlm_cache.db}``;
+    - 优先级:环境变量 > config.yaml 文件值(webui 现状即"加载后再覆盖");
+    - 幂等:对已覆盖的 cfg 重复应用结果不变(webui 的
+      ``apply_data_dir(load_config())`` 双重覆盖依赖此性质)。
+
+    示例(env 显式注入;``cfg.db_path`` 派生为 ``<root>/review_queue.db``,
+    路径分隔符随平台,故以 endswith 断言)::
+
+        cfg = apply_data_dir(Config(), env={"NETSENTINEL_DATA_DIR": "/tmp/x"})
+        cfg.db_path.endswith("review_queue.db")  # -> True
+    """
+    environ = os.environ if env is None else env
+    root = str(environ.get(DATA_DIR_ENV, "") or "").strip()
+    if not root:
+        return cfg
+    cfg.data_dir = root
+    for field_name, parts in _DATA_DIR_DERIVED:
+        setattr(cfg, field_name, str(pathlib.Path(root, *parts)))
+    return cfg
+
+
 def load_config(path: str | None = None) -> Config:
     """加载配置。
 
@@ -506,6 +586,11 @@ def load_config(path: str | None = None) -> Config:
     - 范围校验见 CONTRACTS §2,违反抛 :class:`ValueError`(中文消息;多条违规
       按字段分组列出,便于一次定位全部问题)。
     - 安全红线:``human_gate_required: false`` 会被强制恢复为 ``True`` 并告警。
+    - V10.21:``NETSENTINEL_DATA_DIR`` 环境变量设置且非空白时,对全部返回路径
+      (文件缺失默认 / 空 YAML 默认 / 正常加载)统一应用 :func:`apply_data_dir`
+      覆盖——**环境变量优先于 config.yaml 里的 data_dir 及派生子路径**(与
+      webui ``apply_data_dir(load_config())`` 现状一致);变量未设置/空白时
+      返回值与升级前逐字节一致。
     - 耗时计入 ``telemetry.timer("config.load")``。
 
     示例::
@@ -521,12 +606,12 @@ def load_config(path: str | None = None) -> Config:
         if not file_path.is_file():
             if path is not None:
                 logger.warning("配置文件不存在,使用默认配置:%s", file_path)
-            return Config()
+            return apply_data_dir(Config())
 
         yaml = _import_yaml()
         raw: Any = yaml.safe_load(file_path.read_text(encoding="utf-8"))
         if raw is None:  # 空 YAML 文件 → 全默认
-            return Config()
+            return apply_data_dir(Config())
         if not isinstance(raw, dict):
             raise ValueError(f"配置文件顶层应为键值映射,当前类型为:{type(raw).__name__}")
 
@@ -548,7 +633,8 @@ def load_config(path: str | None = None) -> Config:
             cfg.human_gate_required = True
 
         _validate(cfg)
-        return cfg
+        # V10.21:环境变量覆盖在文件加载/校验之后(env > 文件 > 默认,webui 口径)
+        return apply_data_dir(cfg)
 
 
 def save_config(cfg: Config, path: str) -> None:

@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from netsentinel import telemetry
+from netsentinel import timesource
 
 __all__ = [
     "PRICE_HINTS",
@@ -124,8 +125,13 @@ PRICE_HINTS: dict[str, float] = {
 
 
 def _now_iso() -> str:
-    """当前本地时间(带时区)的 ISO 字符串,供 ts 字段与当日过滤使用。"""
-    return _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+    """当前本地时间(带时区)的 ISO 字符串,供 ts 字段与当日过滤使用。
+
+    V10.21 席位2 时间源单源化:改经 :func:`netsentinel.timesource.now_iso`
+    (基座级),输出与原 ``datetime.now(timezone.utc).astimezone().isoformat(
+    timespec="seconds")`` 惯用式逐字节等价。
+    """
+    return timesource.now_iso()
 
 
 def _round2(value: float) -> float:

@@ -1897,3 +1897,198 @@ class TestHealApprovals:
         assert len(payload["heal_actions"]) == 1
         assert payload["heal_actions"][0]["reviewer"] == "李四"
         assert payload["heal_actions"][0]["event_seq"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 崩溃窗口恢复指引(add 两步 commit 间崩溃:账本有 entry_added 但条目行缺失)
+# ---------------------------------------------------------------------------
+class TestMissingEntryRecoveryGuidance:
+    """review_queue.add 崩溃窗口(entry_added 已记账、条目行未提交)的差异
+    报告与补齐清单须输出**可执行的中文处置指引**(不自动重建条目)。"""
+
+    def _crash_add(self, qdb: Path, edb: Path, monkeypatch) -> int:
+        """构造场景:入列事件落盘成功、条目写入提交前崩溃(返回 entry_id)。"""
+        log, q = open_pair(qdb, edb)
+        _crash_on(log, monkeypatch, EVENT_ENTRY_ADDED)
+        with pytest.raises(RuntimeError, match="模拟崩溃"):
+            q.add(make_report("http://rebuild.test/page"))
+        q.close()
+        log.close()
+        with EventLog(edb) as l2:
+            return int(l2.query(event_type=EVENT_ENTRY_ADDED)[0].entry_id)
+
+    def test_diff_detail_carries_actionable_guidance(
+        self, env, monkeypatch
+    ):
+        """对账差异 detail 含"人工重建或重扫"处置指引与人核对 payload 提示。"""
+        qdb, edb = env
+        entry_id = self._crash_add(qdb, edb, monkeypatch)
+
+        report = replay(qdb, edb)
+        assert not report.ok
+        d = report.diffs[0]
+        assert d.entry_id == entry_id
+        assert d.kind == "事件超前"
+        assert d.actual_status == "(条目不存在)"
+        assert "崩溃" in d.detail  # 原成因描述保留
+        # 可执行处置指引:人工重建或重扫 + 为什么不能自动补齐 + payload 核对
+        assert "人工重建或重扫" in d.detail
+        assert "AUTOINCREMENT" in d.detail
+        assert "payload" in d.detail
+        # JSON 报告同样携带(detail 进 to_dict)
+        assert "人工重建或重扫" in d.to_dict()["detail"]
+
+    def test_apply_ahead_manual_reason_carries_guidance(
+        self, env, monkeypatch
+    ):
+        """补齐计划把该场景列为不可自动补齐,reason 含处置指引(不自动重建)。"""
+        qdb, edb = env
+        entry_id = self._crash_add(qdb, edb, monkeypatch)
+
+        report = replay(qdb, edb)
+        with EventLog(edb) as l2:
+            actions, errors = plan_apply_ahead(report, l2.iter_events())
+        assert errors == []
+        assert len(actions) == 1
+        act = actions[0]
+        assert act.entry_id == entry_id
+        assert act.auto is False  # 绝不自动重建条目
+        assert "无法自动补齐" in act.reason  # 既有文案保留(测试锁定)
+        assert "人工重建或重扫" in act.reason
+
+    def test_cli_outputs_guidance_human_and_json(
+        self, env, monkeypatch, capsys
+    ):
+        """CLI 人读报告与 --json 机器报告都输出处置指引(可执行中文)。"""
+        qdb, edb = env
+        self._crash_add(qdb, edb, monkeypatch)
+
+        rc = replay_module.main([str(edb), str(qdb)])
+        assert rc == EXIT_MISMATCH
+        out = capsys.readouterr().out
+        assert "(条目不存在)" in out
+        assert "人工重建或重扫" in out
+        assert "不可自动补齐" not in out  # 普通对账模式只报差异,无补齐清单
+
+        rc = replay_module.main([str(edb), str(qdb), "--apply-ahead"])
+        assert rc == EXIT_OK
+        out = capsys.readouterr().out
+        assert "不可自动补齐" in out
+        assert "人工重建或重扫" in out
+
+        rc = replay_module.main(
+            [str(edb), str(qdb), "--apply-ahead", "--json"]
+        )
+        assert rc == EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["actions"][0]["auto"] is False
+        assert "人工重建或重扫" in payload["actions"][0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# decision↔storage 解耦接缝:set_queue_factories 可注入工厂
+# ---------------------------------------------------------------------------
+class TestQueueFactoryInjection:
+    """注入 review / four_eyes 队列工厂后,CLI 不再依赖默认 decision 装配;
+    未注入时行为与历史版本一致(默认工厂惰性导入 decision)。"""
+
+    def test_injected_review_factory_used_by_cli(self, env, capsys):
+        """注入 review 工厂 → CLI 对账用注入的替身队列(计数验证被使用)。"""
+        import netsentinel.storage.replay as replay_pkg
+
+        qdb, edb = env
+        log, q = open_pair(qdb, edb)
+        e1 = q.add(make_report(), actor="张三")
+        q.close()
+        log.close()
+
+        calls: list[str] = []
+
+        class SpyQueue:
+            def __init__(self, path: str) -> None:
+                calls.append(path)
+                self._inner = review_queue_module.ReviewQueue(path)
+
+            def list(self):  # noqa: A003 - 鸭子契约与真队列一致
+                return self._inner.list()
+
+            def close(self) -> None:
+                self._inner.close()
+
+        try:
+            replay_pkg.set_queue_factories(
+                review_factory=lambda path: SpyQueue(path)
+            )
+            rc = replay_module.main([str(edb), str(qdb)])
+            assert rc == EXIT_OK  # 一致:替身队列读到同一份 entries
+            assert str(qdb) in calls  # 注入工厂确实被调用
+            assert "对账结论:一致" in capsys.readouterr().out
+        finally:
+            replay_pkg.reset_queue_factories()
+
+    def test_injection_is_optional_and_resettable(self, env):
+        """未注入 → 默认工厂照常(与历史一致);reset 后回到默认。"""
+        import netsentinel.storage.replay as replay_pkg
+
+        qdb, edb = env
+        log, q = open_pair(qdb, edb)
+        q.add(make_report(), actor="张三")
+        q.close()
+        log.close()
+
+        # 未注入:make_review_queue 走默认(惰性导入 decision),行为不变
+        queue = replay_pkg.make_review_queue(str(qdb))
+        try:
+            assert len(queue.list()) == 1
+        finally:
+            queue.close()
+
+        # 注入 → reset → 默认工厂恢复(None 态)
+        replay_pkg.set_queue_factories(
+            review_factory=lambda path: review_queue_module.ReviewQueue(path)
+        )
+        replay_pkg.reset_queue_factories()
+        queue = replay_pkg.make_review_queue(str(qdb))
+        try:
+            assert len(queue.list()) == 1
+        finally:
+            queue.close()
+
+    def test_injected_four_eyes_factory_used_by_cli(self, env, capsys):
+        """注入 four_eyes 工厂 → --four-eyes 对账经注入工厂完成(接缝生效)。
+
+        V10.18 防御性加固:本用例曾在全量跑中偶发一次失败(CLI 报
+        "事件账本不存在")。定位结论:单跑/整文件连跑 20+6 次全绿;
+        产品侧建库→关连接生命周期经实测文件全程在盘;对账内所有连接
+        (queue / four_eyes / 账本)均 finally 关闭;db 路径来自 tmp_path
+        天然用例独立。"账本不存在"只能出自 ``Path.exists()`` 在 CLI 入口
+        检查时返回 False——环境性瞬时(临时目录被并发 pytest 会话的
+        keep=3 保留清理误删,或 AV/索引器瞬时干扰 %TEMP% 下新建的 .db)。
+        加固:CLI 调用前显式断言两库在盘,复现时直接给出可诊断的中文
+        现场信息,而非落到下游退出码断言。
+        """
+        import netsentinel.storage.replay as replay_pkg
+        from netsentinel.decision.four_eyes import FourEyesQueue
+
+        qdb, edb = env
+        log, q = open_pair(qdb, edb)
+        q.add(make_report(), actor="张三")
+        q.close()
+        log.close()
+        # 前置自检:两库此刻必须在盘(连接已全关、WAL 已 checkpoint)。
+        assert edb.exists(), f"事件账本在 CLI 调用前意外缺失:{edb}(临时目录异常?)"
+        assert qdb.exists(), f"复核队列在 CLI 调用前意外缺失:{qdb}(临时目录异常?)"
+
+        calls: list[str] = []
+
+        def fake_factory(path: str):
+            calls.append(path)
+            return FourEyesQueue(path, False)
+
+        try:
+            replay_pkg.set_queue_factories(four_eyes_factory=fake_factory)
+            rc = replay_module.main([str(edb), str(qdb), "--four-eyes"])
+            assert rc == EXIT_OK  # 无 four_eyes 事件:approvals 投影空,一致
+            assert calls == [str(qdb)]  # 注入工厂确实被调用(而非默认装配)
+        finally:
+            replay_pkg.reset_queue_factories()

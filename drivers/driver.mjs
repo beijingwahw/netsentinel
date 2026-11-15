@@ -28,9 +28,14 @@
  *   1. 本驱动绝不识别、绝不绕过、绝不代填验证码;目标是验证码(selector/text 含
  *      captcha/验证码)的 click/fill/select 会被直接拒绝,验证码环节只能走 human_gate。
  *   2. human_gate 步骤一律暂停等待人工回车确认,本驱动不提供任何跳过人工门的参数。
- *   3. 开发与测试期间绝不访问 www.12377.cn / www.shdf.gov.cn:默认拒绝真实门户主机,
- *      只允许 127.0.0.1 / localhost 的 mock(A16);正式提交须人工监督并显式加
- *      --allow-real-portal。
+ *   3. 开发与测试期间绝不访问 www.12377.cn / www.shdf.gov.cn:默认拒绝真实门户主机
+ *      (含子域,如 bzpt.shdf.gov.cn),只允许 127.0.0.1 / localhost 的 mock(A16);
+ *      正式提交须人工监督并显式加 --allow-real-portal。防线共三层:
+ *      a) goto 前守卫 guardUrl:初始 URL 命中真实门户主机即拒绝;
+ *      b) playwright 引擎 goto 后校验最终 host:302 / meta refresh / JS 跳转把页面
+ *         带到真实门户,page.url() 命中即中文报错中止;
+ *      c) playwright 引擎 framenavigated 拦截:任意主/子框架导航到真实门户主机,
+ *         记录违规并关闭页面,下一个原语边界(afterStep/步骤起始)中文报错中止。
  *   4. 提交频控(submit_min_interval_s / submit_max_per_day)由 Python 侧 orchestrator
  *      (A18)强制生效,本驱动不得、也不会绕过。
  *
@@ -48,15 +53,40 @@ const ENGINES = new Set(['console', 'playwright', 'plugin']);
 const REAL_PORTAL_HOSTS = new Set([
   'www.12377.cn', '12377.cn', 'www.shdf.gov.cn', 'shdf.gov.cn',
 ]);
-const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const VALID_ACTIONS = new Set([
   'goto', 'click', 'fill', 'select', 'wait', 'screenshot', 'human_gate',
 ]);
 
-// ------------------------------------------------------------------ 安全守卫
+// ------------------------------------------------------------------ 安全守卫(可测纯函数,全部 export 供 driver.test.mjs 使用)
 
-/** goto 前的 URL 安检:仅 http/https;真实门户默认拒绝(红线 3)。 */
-function guardUrl(url, opts) {
+/** 从任意 URL 安全提取小写主机名;解析失败返回空串(绝不抛错)。 */
+export function hostOf(url) {
+  try {
+    return new URL(String(url)).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 主机名是否命中真实举报门户(红线 3):四个登记主机**或其任意子域**
+ * (如 bzpt.shdf.gov.cn、jbts.12377.cn)。精确等值或 ".域名" 后缀匹配,
+ * "notshdf.gov.cn" / "12377.cn.example.com" 之类伪装域不命中。
+ */
+export function isRealPortalHost(hostname) {
+  const host = String(hostname || '').toLowerCase().trim();
+  if (!host) return false;
+  for (const base of REAL_PORTAL_HOSTS) {
+    if (host === base || host.endsWith(`.${base}`)) return true;
+  }
+  return false;
+}
+
+/**
+ * goto 前的 URL 安检(红线 3 第一层):仅 http/https;真实门户(含子域)
+ * 默认拒绝。opts.allowRealPortal 显式为 true 时放行(人工监督下的正式提交)。
+ */
+export function guardUrl(url, opts = {}) {
   let u;
   try {
     u = new URL(url);
@@ -66,17 +96,32 @@ function guardUrl(url, opts) {
   if (!['http:', 'https:'].includes(u.protocol)) {
     throw new Error(`仅允许 http/https 协议:${url}`);
   }
-  const host = u.hostname.toLowerCase();
-  if (REAL_PORTAL_HOSTS.has(host) && !LOCAL_HOSTS.has(host) && !opts.allowRealPortal) {
+  if (isRealPortalHost(u.hostname) && !opts.allowRealPortal) {
     throw new Error(
-      `目标是真实举报门户 ${host}:测试期间禁止自动化访问;`
+      `目标是真实举报门户 ${u.hostname.toLowerCase()}:测试期间禁止自动化访问;`
+      + '确属人工监督下的正式提交请显式加 --allow-real-portal',
+    );
+  }
+}
+
+/**
+ * goto 之后的最终落点安检(红线 3 第二层):初始 URL 合法(mock)也可能被
+ * 302 / meta refresh / JS 跳转带到真实门户,须以引擎回读的最终 URL 为准。
+ * 命中真实门户主机(含子域)即中文报错,调用方立即中止本计划。
+ */
+export function guardFinalUrl(url, opts = {}) {
+  const host = hostOf(url);
+  if (host && isRealPortalHost(host) && !opts.allowRealPortal) {
+    throw new Error(
+      `安全红线:页面最终落在真实举报门户 ${host}(初始 URL 经跳转/刷新到达),`
+      + '测试期间禁止自动化访问,本计划已中止;'
       + '确属人工监督下的正式提交请显式加 --allow-real-portal',
     );
   }
 }
 
 /** 红线 1:目标是验证码的自动化操作一律拒绝。 */
-function assertNotCaptcha(step) {
+export function assertNotCaptcha(step) {
   const target = [step.selector, step.text, step.label, step.meta?.target]
     .filter(Boolean).join(' ');
   if (/captcha|验证码/i.test(target)) {
@@ -216,40 +261,88 @@ async function createPlaywrightEnv(opts, result) {
   const outDir = opts.outDir || 'data/runs/driver-playwright';
   await mkdir(outDir, { recursive: true });
   let shot = 0;
+
+  // ---- 红线 3 第三层:framenavigated 拦截(主/子框架导航到真实门户即记录违规)。
+  // 事件回调里抛错不会传播到 await 点,故先记录中文违规消息;goto 在途时**不关页**
+  // ——让 goto 落定后由 guardFinalUrl(page.url()) 给出更精确的"最终落点"中文报错
+  // (302 场景);其余在途原语则立即关闭页面中止自动化。无论哪种路径,下一个
+  // 原语边界(本 env 各方法入口/出口、afterStep)都会以中文消息抛错,runPlan
+  // 收敛为计划失败——绝不在真实门户上继续任何步骤。
+  const state = { violation: '', gotoInFlight: false };
+  page.on('framenavigated', (frame) => {
+    if (opts.allowRealPortal || state.violation) return;
+    const host = hostOf(frame.url());
+    if (isRealPortalHost(host)) {
+      state.violation = (
+        `安全红线:页面导航到了真实举报门户 ${host}(302/meta refresh/JS 跳转或子框架),`
+        + '测试期间禁止自动化访问,本计划已中止;'
+        + '确属人工监督下的正式提交请显式加 --allow-real-portal'
+      );
+      if (!state.gotoInFlight) page.close().catch(() => {});
+    }
+  });
+  const assertNoViolation = () => {
+    if (state.violation) throw new Error(state.violation);
+  };
+
   const locatorFor = (selector, text) => (selector
     ? page.locator(selector).first()
     : page.getByText(text).first());
+  const guard = async (fn, { isGoto = false } = {}) => {
+    assertNoViolation();
+    if (isGoto) state.gotoInFlight = true;
+    try {
+      const value = await fn();
+      assertNoViolation(); // 在途期间发生的导航同样在返回前拦截
+      return value;
+    } finally {
+      if (isGoto) state.gotoInFlight = false;
+    }
+  };
   return {
     async goto({ url, timeoutMs }) {
-      guardUrl(url, opts);
-      await page.goto(url, { timeout: timeoutMs, waitUntil: 'domcontentloaded' });
+      return guard(async () => {
+        guardUrl(url, opts); // 第一层:goto 前初始 URL 安检
+        await page.goto(url, { timeout: timeoutMs, waitUntil: 'domcontentloaded' });
+        // 第二层:goto 后以引擎回读的最终 URL 为准(302 落点即真实门户则中止)
+        guardFinalUrl(page.url(), opts);
+      }, { isGoto: true });
     },
     async click({ selector, text, timeoutMs }) {
-      await locatorFor(selector, text).click({ timeout: timeoutMs });
+      return guard(() => locatorFor(selector, text).click({ timeout: timeoutMs }));
     },
     async fill({ selector, text, value, timeoutMs }) {
-      await locatorFor(selector, text).fill(value, { timeout: timeoutMs });
+      return guard(() => locatorFor(selector, text).fill(value, { timeout: timeoutMs }));
     },
     async select({ selector, text, value, timeoutMs }) {
-      await locatorFor(selector, text).selectOption(value, { timeout: timeoutMs });
+      return guard(() => locatorFor(selector, text).selectOption(value, { timeout: timeoutMs }));
     },
     async wait(seconds) {
-      await sleep(Math.max(0, seconds) * 1000);
+      return guard(() => sleep(Math.max(0, seconds) * 1000));
     },
     async screenshot(label) {
-      shot += 1;
-      const file = path.join(outDir, `step-${String(shot).padStart(2, '0')}-${slug(label)}.png`);
-      await page.screenshot({ path: file, fullPage: true });
-      result.screenshots.push(file);
-      console.log(`  [screenshot] ${file}`);
+      return guard(async () => {
+        shot += 1;
+        const file = path.join(outDir, `step-${String(shot).padStart(2, '0')}-${slug(label)}.png`);
+        await page.screenshot({ path: file, fullPage: true });
+        result.screenshots.push(file);
+        console.log(`  [screenshot] ${file}`);
+      });
     },
     async humanGate(step) {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      try {
-        await promptHumanGate(rl, step);
-      } finally {
-        rl.close();
-      }
+      return guard(async () => {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          await promptHumanGate(rl, step);
+        } finally {
+          rl.close();
+        }
+      });
+    },
+    /** 引擎级后置安检:runPlan 在每步完成后调用,导航违规(含等待期间
+     *  的 meta refresh/JS 跳转)在下一个步骤边界立即中止,不留给后续步骤。 */
+    async afterStep() {
+      assertNoViolation();
     },
     async close() {
       await browser.close();
@@ -421,6 +514,9 @@ export async function runPlan(planPath, options = {}) {
         continue;
       }
       await executeStep(step, env, { index: i + 1 });
+      // 引擎级后置安检(红线 3 第三层):playwright 引擎在每步边界检查
+      // framenavigated 记录的真实门户导航违规,命中即中止,不留给后续步骤。
+      await env.afterStep?.();
       result.notes.push(`[ok] ${desc}`);
     }
     result.ok = true;
@@ -440,17 +536,24 @@ export async function runPlan(planPath, options = {}) {
 
 // ------------------------------------------------------------------ CLI
 
+/**
+ * CLI 参数表(单一事实来源,export 供 driver.test.mjs 断言红线 2:
+ * **不含任何跳过/自动确认人工门的参数**;--dry-run 只整体预览计划文本,
+ * 不执行任何步骤,更不会越过人工门提交)。
+ */
+export const CLI_OPTIONS = {
+  engine: { type: 'string', default: 'console' },
+  'out-dir': { type: 'string' },
+  'dry-run': { type: 'boolean', default: false },
+  headless: { type: 'boolean', default: true },
+  'allow-real-portal': { type: 'boolean', default: false },
+  'plugin-module': { type: 'string' },
+};
+
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
-    options: {
-      engine: { type: 'string', default: 'console' },
-      'out-dir': { type: 'string' },
-      'dry-run': { type: 'boolean', default: false },
-      headless: { type: 'boolean', default: true },
-      'allow-real-portal': { type: 'boolean', default: false },
-      'plugin-module': { type: 'string' },
-    },
+    options: CLI_OPTIONS,
   });
   const planPath = positionals[0];
   if (!planPath) {

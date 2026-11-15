@@ -50,6 +50,10 @@ A217 的 :mod:`netsentinel.vision.guard_adapter` 把守卫模型的文本判定�
 - **产出仅为标定建议**:常量映射(0.95/0.05)是否采纳是人工决策,本模块
   不改任何生产常量、不写任何状态文件。
 
+注:本模块全部"红线 38"均指 **38(B) 面**(CONTRACTS-V10 §0,统计诚实性:
+conformal 认证层 / CP 下界闭式报告 / 对抗评测须伴 CI);38(A) 面是
+golive 只读验证语义,编号重号歧义消歧见 docs/REDLINES.md §二。
+
 CLI::
 
     python -m netsentinel.vision.guard_calib <records.jsonl> \

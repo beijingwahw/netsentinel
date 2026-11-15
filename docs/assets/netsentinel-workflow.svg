@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="460" viewBox="0 0 1280 460" role="img" aria-labelledby="title desc" font-family="'Noto Sans CJK SC','Source Han Sans SC','Microsoft YaHei','PingFang SC',Arial,sans-serif">
+  <title id="title">NetSentinel 工作流</title>
+  <desc id="desc">从线索输入、网页抽样、识别判定到人工复核、辅助填表和人工提交的六步流程；前三步由系统辅助，后三步由人工把关。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f8fbff"/>
+    </linearGradient>
+    <linearGradient id="autoCard" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eff6ff"/>
+    </linearGradient>
+    <linearGradient id="humanCard" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#fff7ed"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0f172a" flood-opacity="0.08"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#ea580c"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="460" rx="24" fill="url(#bg)" stroke="#e2e8f0"/>
+  <text x="44" y="46" font-size="24" font-weight="800" fill="#0f172a">从 URL 到举报：系统在人工门前止步</text>
+  <text x="44" y="74" font-size="15" fill="#64748b">蓝色步骤由系统辅助完成；橙色步骤必须由人工核实、确认或操作。</text>
+
+  <rect x="40" y="94" width="580" height="244" rx="22" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="58" y="119" font-size="13" font-weight="800" fill="#1d4ed8" letter-spacing="1">SYSTEM ASSIST · 系统辅助</text>
+  <rect x="660" y="94" width="580" height="244" rx="22" fill="#fff7ed" stroke="#fed7aa"/>
+  <text x="706" y="119" font-size="13" font-weight="800" fill="#c2410c" letter-spacing="1">HUMAN CONTROL · 人工把关</text>
+
+  <g filter="url(#cardShadow)">
+    <g transform="translate(54 132)">
+      <rect width="176" height="190" rx="18" fill="url(#autoCard)" stroke="#bfdbfe"/>
+      <circle cx="27" cy="29" r="16" fill="#2563eb"/>
+      <text x="27" y="34" text-anchor="middle" font-size="15" font-weight="800" fill="#ffffff">1</text>
+      <circle cx="88" cy="64" r="23" fill="#dbeafe"/>
+      <circle cx="82" cy="58" r="9" fill="none" stroke="#2563eb" stroke-width="3"/>
+      <path d="M89 65 L99 75" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+      <text x="18" y="104" font-size="17" font-weight="800" fill="#0f172a">线索输入</text>
+      <text x="18" y="132" font-size="13" fill="#475569">URL / TXT / CSV</text>
+      <text x="18" y="153" font-size="13" fill="#475569">YAML / 关键词发现</text>
+      <text x="18" y="176" font-size="12" fill="#64748b">目标清单进入批量流水线</text>
+    </g>
+    <g transform="translate(242 132)">
+      <rect width="176" height="190" rx="18" fill="url(#autoCard)" stroke="#bfdbfe"/>
+      <circle cx="27" cy="29" r="16" fill="#2563eb"/>
+      <text x="27" y="34" text-anchor="middle" font-size="15" font-weight="800" fill="#ffffff">2</text>
+      <rect x="66" y="44" width="44" height="38" rx="6" fill="#dbeafe" stroke="#60a5fa" stroke-width="2"/>
+      <path d="M66 56 H110 M76 68 H98" stroke="#2563eb" stroke-width="2"/>
+      <circle cx="124" cy="64" r="10" fill="none" stroke="#0ea5e9" stroke-width="3"/>
+      <text x="18" y="104" font-size="17" font-weight="800" fill="#0f172a">网页抽样</text>
+      <text x="18" y="132" font-size="13" fill="#475569">同站 BFS / 截图</text>
+      <text x="18" y="153" font-size="13" fill="#475569">图片下载 / 文本提示</text>
+      <text x="18" y="176" font-size="12" fill="#64748b">抓取范围受配置约束</text>
+    </g>
+    <g transform="translate(430 132)">
+      <rect width="176" height="190" rx="18" fill="url(#autoCard)" stroke="#bfdbfe"/>
+      <circle cx="27" cy="29" r="16" fill="#2563eb"/>
+      <text x="27" y="34" text-anchor="middle" font-size="15" font-weight="800" fill="#ffffff">3</text>
+      <path d="M64 64 C77 46 103 46 116 64 C103 82 77 82 64 64Z" fill="#dbeafe" stroke="#2563eb" stroke-width="2.5"/>
+      <circle cx="90" cy="64" r="10" fill="#2563eb"/>
+      <circle cx="90" cy="64" r="4" fill="#ffffff"/>
+      <text x="18" y="104" font-size="17" font-weight="800" fill="#0f172a">识别与证据</text>
+      <text x="18" y="132" font-size="13" fill="#475569">20 家 VLM / 融合判定</text>
+      <text x="18" y="153" font-size="13" fill="#475569">clean / suspect / nsfw</text>
+      <text x="18" y="176" font-size="12" fill="#64748b">生成证据包并入复核队列</text>
+    </g>
+
+    <g transform="translate(674 132)">
+      <rect width="176" height="190" rx="18" fill="url(#humanCard)" stroke="#fdba74"/>
+      <circle cx="27" cy="29" r="16" fill="#ea580c"/>
+      <text x="27" y="34" text-anchor="middle" font-size="15" font-weight="800" fill="#ffffff">4</text>
+      <circle cx="88" cy="62" r="13" fill="#ffedd5" stroke="#ea580c" stroke-width="2.5"/>
+      <path d="M70 89 C70 78 106 78 106 89" fill="none" stroke="#ea580c" stroke-width="3" stroke-linecap="round"/>
+      <path d="M117 48 L124 55 L136 40" fill="none" stroke="#0f766e" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="18" y="104" font-size="17" font-weight="800" fill="#0f172a">人工复核</text>
+      <text x="18" y="132" font-size="13" fill="#475569">逐张核对证据与分值</text>
+      <text x="18" y="153" font-size="13" fill="#475569">approve / reject 留痕</text>
+      <text x="18" y="176" font-size="12" fill="#9a3412">机器判定不豁免人工</text>
+    </g>
+    <g transform="translate(862 132)">
+      <rect width="176" height="190" rx="18" fill="url(#humanCard)" stroke="#fdba74"/>
+      <circle cx="27" cy="29" r="16" fill="#ea580c"/>
+      <text x="27" y="34" text-anchor="middle" font-size="15" font-weight="800" fill="#ffffff">5</text>
+      <rect x="67" y="43" width="44" height="44" rx="7" fill="#ffedd5" stroke="#f97316" stroke-width="2.5"/>
+      <path d="M76 56 H102 M76 67 H96 M76 78 H90" stroke="#ea580c" stroke-width="2.5" stroke-linecap="round"/>
+      <text x="18" y="104" font-size="17" font-weight="800" fill="#0f172a">辅助填表</text>
+      <text x="18" y="132" font-size="13" fill="#475569">上传证据 / 自动填字段</text>
+      <text x="18" y="153" font-size="13" fill="#475569">FOCUS 聚焦验证码框</text>
+      <text x="18" y="176" font-size="12" fill="#9a3412">验证码绝不自动识别</text>
+    </g>
+    <g transform="translate(1050 132)">
+      <rect width="176" height="190" rx="18" fill="url(#humanCard)" stroke="#fdba74"/>
+      <circle cx="27" cy="29" r="16" fill="#ea580c"/>
+      <text x="27" y="34" text-anchor="middle" font-size="15" font-weight="800" fill="#ffffff">6</text>
+      <rect x="69" y="54" width="40" height="32" rx="6" fill="#ffedd5" stroke="#f97316" stroke-width="2.5"/>
+      <path d="M76 54 V45 C76 38 102 38 102 45 V54" fill="none" stroke="#ea580c" stroke-width="3"/>
+      <circle cx="89" cy="68" r="4" fill="#ea580c"/>
+      <text x="18" y="104" font-size="17" font-weight="800" fill="#0f172a">人工提交</text>
+      <text x="18" y="132" font-size="13" fill="#475569">核对附件 / 输入验证码</text>
+      <text x="18" y="153" font-size="13" fill="#475569">人工回车并点击提交</text>
+      <text x="18" y="176" font-size="12" fill="#9a3412">最终动作永远属于人</text>
+    </g>
+  </g>
+
+  <g stroke-width="2.5" marker-end="url(#arrowBlue)" opacity="0.9">
+    <path d="M231 227 H239"/>
+    <path d="M419 227 H427"/>
+  </g>
+  <g stroke="#ea580c" stroke-width="2.5" marker-end="url(#arrowOrange)" opacity="0.9">
+    <path d="M851 227 H859"/>
+    <path d="M1039 227 H1047"/>
+  </g>
+
+  <line x1="640" y1="96" x2="640" y2="336" stroke="#f97316" stroke-width="2" stroke-dasharray="7 8"/>
+  <rect x="590" y="84" width="100" height="30" rx="15" fill="#ea580c"/>
+  <text x="640" y="104" text-anchor="middle" font-size="13" font-weight="800" fill="#ffffff">人工门</text>
+
+  <rect x="40" y="356" width="1200" height="72" rx="18" fill="#fff7ed" stroke="#fdba74"/>
+  <circle cx="72" cy="392" r="18" fill="#ea580c"/>
+  <path d="M72 380 V393 M72 402 V403" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+  <text x="104" y="386" font-size="17" font-weight="800" fill="#9a3412">不可绕过的边界：验证码与最终提交按钮永远留给人工</text>
+  <text x="104" y="411" font-size="14" fill="#7c2d12">安全默认 allow_network=false · dry_run_default=true · vlm_online=false · 提交频控 60s / 每日 5 条</text>
+</svg>

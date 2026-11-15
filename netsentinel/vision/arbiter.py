@@ -35,14 +35,22 @@ V5(A86)升级:分歧聚合保持**单遍**(member_scores 一次循环内 setdict
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import math
 from typing import Any, Callable
 
 from netsentinel import telemetry
-from netsentinel.contracts import Config, ImageEvidence, ImageScore
+from netsentinel.contracts import Config, ImageScore
+from netsentinel.vision._vlm_helpers import (
+    build_glm_client as _build_glm_client_shared,
+    build_vlm_cache as _build_vlm_cache_shared,
+    cache_key as _cache_key,
+    extract_prob as _extract_prob,
+    extract_reasoning as _extract_reasoning,
+    is_budget_error as _is_budget_error,
+    is_offline_error as _is_offline_error,
+    sanitize_prob as _sanitize_prob,
+)
 
 __all__ = ["DISAGREE_GAP", "ARBITER_MODEL", "arbitrate"]
 
@@ -105,8 +113,15 @@ def _arbiter_prompts() -> tuple[str, Callable[..., str]]:
         raw_builder = getattr(vlm_prompts, "build_user_prompt", None)
         if callable(raw_builder):
             builder = raw_builder
-    except Exception:
+    except ImportError:
+        # 兄弟模块未就位属正常并行开发场景:静默退回内置缺省提示词。
         pass
+    except Exception as exc:
+        # 模块内 bug(如模块级初始化抛错)不再被无声吞掉:记一条 debug 便于诊断;
+        # 行为保持不变——仍退回内置缺省提示词,仲裁主流程不受影响。
+        logger.debug(
+            "vlm_prompts 增强提示词加载失败(%s),仲裁退回内置缺省提示词", exc
+        )
     return system, builder
 
 
@@ -115,113 +130,33 @@ def _default_build_user_prompt(kind: str, **ctx: Any) -> str:
     return json.dumps({"kind": kind, **ctx}, ensure_ascii=False)
 
 
-def _is_offline_error(exc: BaseException) -> bool:
-    """识别 glm_adapter.VlmOfflineError;模块未就位时按异常类名识别。"""
-    try:
-        from netsentinel.vision.glm_adapter import VlmOfflineError
-        if isinstance(exc, VlmOfflineError):
-            return True
-    except Exception:
-        pass
-    return type(exc).__name__ == "VlmOfflineError"
-
-
-def _is_budget_error(exc: BaseException) -> bool:
-    """识别 vlm_cache.VlmBudgetExceeded;模块未就位时按异常类名识别。"""
-    try:
-        from netsentinel.vision.vlm_cache import VlmBudgetExceeded
-        if isinstance(exc, VlmBudgetExceeded):
-            return True
-    except Exception:
-        pass
-    return type(exc).__name__ == "VlmBudgetExceeded"
-
+# ---------------------------------------------------------------------------
+# 惰性构造(单一实现在 _vlm_helpers;此处保留同名薄封装,
+# 日志文案与提取前逐字一致,对外 API 不变)
+# ---------------------------------------------------------------------------
 
 def _build_client(cfg: Config) -> Any:
     """惰性构造 GlmVlmClient;离线 / 模块未就位 / 构造失败 → None(原样返回)。"""
-    try:
-        from netsentinel.vision.glm_adapter import GlmVlmClient
-    except Exception as exc:
-        logger.warning("GLM 客户端模块不可用(%s),本轮不做仲裁", exc)
-        return None
-    try:
-        return GlmVlmClient(cfg)
-    except Exception as exc:
-        logger.warning("GLM 客户端构造失败或处于离线状态(%s),本轮不做仲裁", exc)
-        return None
+    return _build_glm_client_shared(
+        cfg,
+        import_fail_msg="GLM 客户端模块不可用(%s),本轮不做仲裁",
+        build_fail_msg="GLM 客户端构造失败或处于离线状态(%s),本轮不做仲裁",
+    )
 
 
 def _build_cache(cfg: Config) -> Any:
     """惰性构造 VlmCache;模块未就位 / 构造失败 → None(原样返回)。"""
-    try:
-        from netsentinel.vision.vlm_cache import VlmCache
-    except Exception as exc:
-        logger.warning("VLM 缓存模块不可用(%s),本轮不做仲裁", exc)
-        return None
-    try:
-        return VlmCache(cfg.vlm_cache_db, cfg.vlm_daily_budget)
-    except TypeError:
-        # 兼容仅接收 db_path 的旧签名(daily_limit 关键字形态差异)。
-        try:
-            return VlmCache(cfg.vlm_cache_db)
-        except Exception as exc:
-            logger.warning("VLM 缓存构造失败(%s),本轮不做仲裁", exc)
-            return None
-    except Exception as exc:
-        logger.warning("VLM 缓存构造失败(%s),本轮不做仲裁", exc)
-        return None
+    return _build_vlm_cache_shared(
+        cfg,
+        import_fail_msg="VLM 缓存模块不可用(%s),本轮不做仲裁",
+        build_fail_msg="VLM 缓存构造失败(%s),本轮不做仲裁",
+    )
 
 
 # ---------------------------------------------------------------------------
-# 纯辅助
+# 纯辅助(_sanitize_prob/_extract_prob/_extract_reasoning/_cache_key 的
+# 单一实现在 _vlm_helpers,顶部按原名导入)
 # ---------------------------------------------------------------------------
-
-def _cache_key(image: ImageEvidence) -> str:
-    """缓存键:优先 sha256;缺失时用路径的稳定 sha256(跨进程一致,避免内置 hash 随机化)。"""
-    if image.sha256:
-        return image.sha256
-    return hashlib.sha256(image.path.encode("utf-8", "surrogatepass")).hexdigest()
-
-
-def _sanitize_prob(value: Any) -> float | None:
-    """把任意值规整为 [0,1] 内的概率;不可数值化 / NaN / Inf → None。"""
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(number) or math.isinf(number):
-        return None
-    if number < 0.0:
-        return 0.0
-    if number > 1.0:
-        return 1.0
-    return number
-
-
-def _extract_prob(data: Any) -> float | None:
-    """从 VLM 返回 / 缓存载荷中只提取数值字段 nsfw_prob。
-
-    红线 8(提示注入防御):返回内容里任何"指令 / 要求"一律忽略,解析失败按缺失处理。
-    """
-    if isinstance(data, dict):
-        if "nsfw_prob" not in data:
-            return None
-        return _sanitize_prob(data.get("nsfw_prob"))
-    if isinstance(data, (int, float)):
-        return _sanitize_prob(data)
-    return None
-
-
-def _extract_reasoning(data: Any) -> str:
-    """提取 reasoning 字段(仅接受字符串,其余忽略)。"""
-    if isinstance(data, dict):
-        value = data.get("reasoning", "")
-        if isinstance(value, str):
-            return value
-    return ""
-
 
 def _safe_cache_get(cache: Any, path: str, version: str, key: str) -> Any:
     """读缓存;异常按未命中处理并记日志,不让缓存故障中断仲裁。"""

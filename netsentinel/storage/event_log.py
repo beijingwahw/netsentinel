@@ -14,8 +14,8 @@
 
 append-only 的三层保证:
 
-1. **API 层**:本类只暴露 ``append`` / ``iter_events`` / ``query`` /
-   ``latest_seq`` 四个数据面方法,没有任何 UPDATE / DELETE 路径;
+1. **API 层**:本类只暴露 ``append`` / ``append_many`` / ``iter_events`` /
+   ``query`` / ``latest_seq`` 五个数据面方法,没有任何 UPDATE / DELETE 路径;
 2. **数据库层**:``BEFORE UPDATE`` / ``BEFORE DELETE`` 触发器对 events 表
    一律 ``RAISE(ABORT, 中文消息)``——绕过本类、拿裸 sqlite3 连接直改也会被
    拒绝(想篡改必须先 DROP TRIGGER,而触发器被 DROP 这件事本身就会让重放
@@ -65,6 +65,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -184,13 +185,59 @@ def _is_lock_error(exc: sqlite3.Error) -> bool:
     )
 
 
+#: 事件落盘 INSERT(单条与批量共用同一语句,参数顺序与列序一致)。
+_INSERT_EVENT_SQL = (
+    "INSERT INTO events (ts, event_type, entry_id, actor, payload_json)"
+    " VALUES (?, ?, ?, ?, ?)"
+)
+
+
+def _validate_and_serialize(
+    event_type: str,
+    entry_id: int,
+    *,
+    actor: str = "",
+    payload: dict[str, Any] | None = None,
+) -> tuple[str, int, str, str]:
+    """校验并序列化一条事件参数 → ``(event_type, entry_id, actor, payload_json)``。
+
+    单条 :meth:`EventLog.append` 与批量 :meth:`EventLog.append_many` 共用
+    同一套校验判例(参数类型 / payload JSON 规范化,中文报错、检查顺序
+    完全一致)——批量口不引入任何第二套判例。
+    """
+    if not isinstance(event_type, str) or not event_type.strip():
+        raise EventLogError(
+            f"事件类型必须是非空字符串:{event_type!r}"
+        )
+    if isinstance(entry_id, bool) or not isinstance(entry_id, int):
+        raise EventLogError(f"条目编号必须是整数:{entry_id!r}")
+    if not isinstance(actor, str):
+        raise EventLogError(f"操作署名必须是字符串:{actor!r}")
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise EventLogError(
+            f"事件负载必须是 dict 或 None:{type(payload).__name__}"
+        )
+    try:
+        # 确定性序列化:键排序 + 紧凑分隔符,同一 payload 字节级稳定。
+        payload_json = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError) as exc:
+        raise EventLogError(f"事件负载无法 JSON 序列化:{exc}") from exc
+    return event_type, int(entry_id), actor, payload_json
+
+
 class EventLog:
     """append-only 事件账本(SQLite WAL,线程安全,组合 SQLiteKernel)。
 
     本类**没有任何 UPDATE / DELETE 路径**:事件一经 ``append`` 落盘即为
     事实,数据库触发器会拒绝绕过本类的直接改写(见模块 docstring 的三层
-    append-only 保证)。支持 ``with`` 上下文;写入即时 commit(单条 INSERT
-    自成事务,原子:要么整条在,要么整条不在,不存在半条事件)。
+    append-only 保证)。支持 ``with`` 上下文;写入路径两条:单条 ``append``
+    即时 commit(单条 INSERT 自成事务,原子:要么整条在,要么整条不在,
+    不存在半条事件);批量 :meth:`append_many` 整批单事务一次 commit
+    (任一条非法整批拒绝,见其 docstring)。
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -239,32 +286,13 @@ class EventLog:
             确定性);``None`` 视为 ``{}``。
         :raises EventLogError: 参数非法 / payload 不可 JSON 序列化(中文消息)。
         """
-        if not isinstance(event_type, str) or not event_type.strip():
-            raise EventLogError(
-                f"事件类型必须是非空字符串:{event_type!r}"
-            )
-        if isinstance(entry_id, bool) or not isinstance(entry_id, int):
-            raise EventLogError(f"条目编号必须是整数:{entry_id!r}")
-        if not isinstance(actor, str):
-            raise EventLogError(f"操作署名必须是字符串:{actor!r}")
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            raise EventLogError(
-                f"事件负载必须是 dict 或 None:{type(payload).__name__}"
-            )
-        try:
-            # 确定性序列化:键排序 + 紧凑分隔符,同一 payload 字节级稳定。
-            payload_json = json.dumps(
-                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-        except (TypeError, ValueError) as exc:
-            raise EventLogError(f"事件负载无法 JSON 序列化:{exc}") from exc
+        event_type, entry_id, actor, payload_json = _validate_and_serialize(
+            event_type, entry_id, actor=actor, payload=payload
+        )
         try:
             cur = self._kernel.execute(
-                "INSERT INTO events (ts, event_type, entry_id, actor, payload_json)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (now_iso(), event_type, int(entry_id), actor, payload_json),
+                _INSERT_EVENT_SQL,
+                (now_iso(), event_type, entry_id, actor, payload_json),
             )
         except sqlite3.DatabaseError as exc:
             if _is_lock_error(exc):
@@ -275,6 +303,98 @@ class EventLog:
         seq = int(cur.lastrowid or 0)
         telemetry.inc("storage.event_log.append")
         return seq
+
+    def append_many(self, events: Iterable[Mapping[str, Any]]) -> list[int]:
+        """原子批量追加一批事件(整批单事务、一次 commit),返回各事件 seq
+        (按入参顺序,账本内连续无洞)。
+
+        语义 = 逐条 :meth:`append` 的**原子化**:
+
+        - **任一条非法整批拒绝**:先对整批做与 ``append`` 完全一致的参数
+          校验与 payload 序列化(:func:`_validate_and_serialize`,零第二套
+          判例),校验阶段零 DB 触碰;任何一条非法 → 中文
+          :class:`EventLogError`(含条目序号),整批一条都不落库;
+        - **单事务一次 commit**:通过锁内 ``BEGIN IMMEDIATE`` 起事务、
+          连续 INSERT、提交前校验本批 seq 逐条连续(不变式"1..N 无洞
+          不重"),全部成功才 commit;任何一步失败整批回滚(回滚的 INSERT
+          不占号,seq 连续性保持,后续追加不受影响);
+        - 并发与崩溃语义与 ``append`` 同源:同实例由内核锁串行化、跨连接
+          由 WAL 忙等串行化;进程崩溃时整批要么完整落盘要么完全不存在。
+
+        事务实现沿用内核惯例(:meth:`netsentinel.storage.kernel.SQLiteKernel.migrate`
+        的 ``BEGIN IMMEDIATE`` 单事务与 :class:`~netsentinel.storage.kernel.Repo`
+        的锁内直执同构),不改内核文件;语句仍经内核 ``_exec`` 计数,
+        可观测性保持。
+
+        :param events: 事件规格可迭代对象(一次性消费);每项是含
+            ``event_type`` / ``entry_id``(必填)与 ``actor`` / ``payload``
+            (可选,缺省与 ``append`` 一致)的映射;非映射项 / 含未知键 /
+            缺必填键 → 整批拒绝(中文报错)。
+        :raises EventLogError: 任一条参数非法 / payload 不可 JSON 序列化 /
+            seq 不连续 / 写入失败(疑似损坏);锁等待(BUSY)类错误原样上抛。
+        """
+        prepared: list[tuple[str, int, str, str, str]] = []
+        for idx, item in enumerate(events, start=1):
+            if not isinstance(item, Mapping):
+                raise EventLogError(
+                    f"第 {idx} 条事件规格必须是映射(dict):{type(item).__name__}"
+                )
+            unknown_keys = sorted(set(item) - {"event_type", "entry_id", "actor", "payload"})
+            if unknown_keys:
+                raise EventLogError(
+                    f"第 {idx} 条事件规格含未知键:{unknown_keys}"
+                    "(仅允许 event_type / entry_id / actor / payload)"
+                )
+            if "event_type" not in item or "entry_id" not in item:
+                raise EventLogError(
+                    f"第 {idx} 条事件规格缺少必填键:event_type / entry_id"
+                )
+            event_type, entry_id, actor, payload_json = _validate_and_serialize(
+                item["event_type"],
+                item["entry_id"],
+                actor=item.get("actor", ""),
+                payload=item.get("payload"),
+            )
+            prepared.append((now_iso(), event_type, entry_id, actor, payload_json))
+        if not prepared:
+            return []
+        k = self._kernel
+        conn = k._conn
+        seqs: list[int] = []
+        with k._lock:
+            began = False
+            try:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                    began = True
+                for ts, event_type, entry_id, actor, payload_json in prepared:
+                    cur = k._exec(_INSERT_EVENT_SQL, (ts, event_type, entry_id, actor, payload_json))
+                    seqs.append(int(cur.lastrowid or 0))
+                # seq 连续性校验(提交前):单事务内 rowid 应逐条 +1 连续分配,
+                # 违反即底层异常——整批回滚拒绝,绝不让有洞/重复批次落库。
+                first = seqs[0]
+                for offset, seq in enumerate(seqs):
+                    if seq != first + offset:
+                        raise EventLogError(
+                            f"批量追加分配到的 seq 不连续(起点 {first},"
+                            f"实际序列 {seqs}):已整批回滚,seq 无洞不重的"
+                            "账本不变式保持"
+                        )
+                conn.commit()
+            except sqlite3.DatabaseError as exc:
+                if began:
+                    conn.rollback()
+                if _is_lock_error(exc):
+                    raise
+                raise EventLogError(
+                    f"事件账本批量写入失败(疑似损坏):{exc}"
+                ) from exc
+            except BaseException:
+                if began:
+                    conn.rollback()
+                raise
+        telemetry.inc("storage.event_log.append_many")
+        return seqs
 
     # ------------------------------------------------------------------
     # 读取

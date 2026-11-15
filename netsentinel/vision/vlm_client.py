@@ -51,6 +51,23 @@ False = 现状零落账,向后兼容)时生效。落账是**旁路**:全路径 t
 主流程。``run_id`` 沿 cfg 附加属性 ``cfg.run_id`` 透传(A232 指引 ②);
 类属性 :attr:`UniversalVLMClient._ledger_records_cost` 标记"本客户端自
 落账",供 vlmctl ping 等上层调用点避免同一笔调用双记。
+
+A74 接线(每提供方礼貌限速,**默认禁用**):``_post_with_retry`` 的每次真实
+外呼尝试前经 :func:`_throttle_acquire` 取令牌——``provider_throttle`` 的
+每提供方令牌桶(每桶容量 2,补速 ``rpm/60`` 每秒)。开启方式二选一:
+模块级 :func:`set_default_rpm(rpm)`(进程级,优先)或给 cfg 挂附加实例属性
+``cfg.provider_rpm = <int>``;两者都未设置(缺省)时完全不限速,传输层
+行为与接线前逐字节一致(项目红线:新接线默认关闭)。
+
+V10.18 健壮性/可观测补齐(默认路径零行为变化):
+
+- **响应体大小上限**:默认传输层响应读取带 :data:`RESPONSE_MAX_MB`
+  (10MiB)上限——上限内与整读逐字节等价;成功响应超限抛中文
+  ``RuntimeError``(与传输层读取中途异常同口径,不走 URLError 重试),
+  错误体超限截断到上限再按状态码处理(防异常超大响应占内存);
+- **限速等待遥测**:``_throttle_acquire`` 在 ``acquire`` 真实等待(返回
+  秒数 > 0)时计 ``vision.throttle.wait`` 并 observe 同名等待时长
+  (``ProviderThrottle.acquire`` 内部的 ``throttle.waited`` 计数保持不变)。
 """
 from __future__ import annotations
 
@@ -76,6 +93,7 @@ __all__ = [
     "VlmConfigError",
     "ModelNotFoundError",
     "encode_image",
+    "set_default_rpm",
     "UniversalVLMClient",
 ]
 
@@ -86,6 +104,11 @@ Transport = Callable[[str, dict[str, str], dict[str, Any], float], tuple[int, st
 
 #: 单图送审大小上限(兆字节),与 Config.vlm_max_image_mb 默认值一致
 DEFAULT_MAX_IMAGE_MB = 8.0
+#: (V10.18)HTTP 响应体大小上限(兆字节):正常 VLM JSON 响应远小于该值,
+#: 防御异常超大响应(网关故障回灌 / 恶意端点)无界 read 占内存
+RESPONSE_MAX_MB = 10.0
+#: (V10.18)响应体分块读取的块大小(字节)
+_READ_CHUNK_BYTES = 65536
 #: 采样温度:内容审核要求输出稳定,取低温
 TEMPERATURE = 0.1
 #: 返回长度上限(token);anthropic 方言 max_tokens 必填
@@ -224,6 +247,39 @@ def _json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
+def _read_capped(stream: Any) -> tuple[str, bool]:
+    """(V10.18)分块读取 HTTP 响应体,返回 ``(解码文本, 是否超上限)``。
+
+    等价性:对不超过 :data:`RESPONSE_MAX_MB` 的响应,分块 ``read(n)`` 循环
+    到空串与整读 ``stream.read()`` 返回的字节完全相同(``http.client`` 两种
+    读取语义一致),拼接后同样 ``utf-8`` replace 解码——行为逐字节不变。
+    超上限时停止读取:调用方决定抛错(成功响应,与传输层异常同类口径的
+    中文 RuntimeError)或截断使用(错误响应体,仅用于 ``[:200]`` 片段与
+    错误标记匹配)。异常消息只报大小与上限,不回显响应内容。
+    """
+    limit = int(RESPONSE_MAX_MB * 1024 * 1024)
+    chunks: list[bytes] = []
+    total = 0
+    exceeded = False
+    while True:
+        chunk = stream.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            exceeded = True
+            # 保留恰好 limit 字节的前缀(错误体截断使用;成功路径反正抛错)
+            chunks.append(chunk[: limit - (total - len(chunk))])
+            break
+        chunks.append(chunk)
+    if exceeded:
+        logger.warning(
+            "HTTP 响应体超过大小上限,已中止读取:已读=%.2fMB 上限=%.2fMB",
+            total / 1024 / 1024, RESPONSE_MAX_MB,
+        )
+    return b"".join(chunks).decode("utf-8", errors="replace"), exceeded
+
+
 def _http_post_json(
     url: str,
     headers: dict[str, str],
@@ -238,18 +294,27 @@ def _http_post_json(
       避免重试时对含大图 base64 的载荷反复 ``json.dumps``;
     - ``HTTPError`` 不上抛,捕获后转成 ``(状态码, 错误体文本)`` 返回,由调用方
       按状态码决定回退 / 报错;
-    - 其余 ``URLError``(网络层错误)原样上抛,由上层指数退避重试。
+    - 其余 ``URLError``(网络层错误)原样上抛,由上层指数退避重试;
+    - (V10.18)响应体读取带 :data:`RESPONSE_MAX_MB` 上限:成功响应超限抛
+      中文 RuntimeError(读取中途异常本就不走 URLError 重试,口径一致);
+      错误响应体超限截断到上限(错误体仅用于 200 字符片段与标记匹配,
+      正常错误体远小于上限,可观测行为不变)。
     """
     body_bytes = data if data is not None else _json_bytes(payload)
     request = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
+            body, exceeded = _read_capped(response)
+            if exceeded:
+                raise RuntimeError(
+                    f"接口响应体超过大小上限,已中止读取并拒绝解析:"
+                    f"上限={RESPONSE_MAX_MB:.2f}MB"
+                )
             status = int(getattr(response, "status", 200) or 200)
             return status, body
     except urllib.error.HTTPError as exc:  # HTTP 层错误:转为状态码 + 错误体
         try:
-            body = exc.read().decode("utf-8", errors="replace")
+            body, _ = _read_capped(exc)
         except Exception:  # noqa: BLE001 - 错误体读取失败不应掩盖状态码
             body = ""
         return int(exc.code), body
@@ -338,6 +403,102 @@ def _breaker_record_success(provider: str) -> None:
         was_open = state is not None and state.opened_at is not None
     if was_open:
         logger.info("提供方 %s 断路器探活成功,已恢复放行", provider)
+
+
+# ---------------------------------------------------------------------------
+# (A74 接线)每提供方礼貌限速:默认禁用,经 set_default_rpm / cfg 附加属性开启
+# ---------------------------------------------------------------------------
+
+#: (A74)进程级限速器(:func:`set_default_rpm` 设置,优先级最高);``None`` = 未启用。
+_THROTTLE: Any = None
+#: (A74)cfg 附加属性 ``provider_rpm`` 惰性建出的限速器与对应 rpm(避免每请求重建)。
+_CFG_THROTTLE: Any = None
+_CFG_THROTTLE_RPM: int | None = None
+_THROTTLE_LOCK = threading.Lock()
+
+
+def set_default_rpm(rpm: int | None) -> None:
+    """(A74 接线注入点)启用/禁用统一传输层的每提供方礼貌限速。
+
+    - ``rpm`` 为 ``>=1`` 的整数 → 创建进程级
+      :class:`~netsentinel.vision.provider_throttle.ProviderThrottle`
+      (``default_rpm=rpm``,未登记提供方一律按该 RPM 限速,每桶容量 2 允许
+      小幅突发),此后**所有**经本模块 ``chat_json`` 的真实外呼(含重试跳)
+      外呼前都先 ``acquire(provider)`` 取令牌,超速则阻塞等待
+      (真实等待计入遥测 ``throttle.waited``);
+    - ``rpm`` 为 ``None`` / ``<1`` / 不可数值化 → 禁用(缺省状态),
+      传输层行为与接线前逐字节一致(项目红线:新接线默认关闭,主线零影响);
+    - 保守礼貌场景建议 ``set_default_rpm(2)``;进程级设置优先于 cfg 附加属性。
+
+    另一条开启路径:在构造调用链入口给 cfg 挂**附加实例属性**
+    ``cfg.provider_rpm = <>=1 的整数>``(与 ``cost_ledger_enabled`` 同款的
+    getattr 动态读取,不新增 Config 字段);两种方式都未设置时(缺省)
+    完全不限速。
+    """
+    global _THROTTLE
+    try:
+        rpm_val = None if rpm is None else int(rpm)
+    except (TypeError, ValueError):
+        rpm_val = None
+    if rpm_val is None or rpm_val < 1:
+        _THROTTLE = None
+        return
+    from netsentinel.vision.provider_throttle import ProviderThrottle  # 惰性导入
+
+    _THROTTLE = ProviderThrottle(default_rpm=rpm_val)
+    logger.info("每提供方礼貌限速已启用(默认 RPM=%d,每桶容量 2)", rpm_val)
+
+
+def _resolve_throttle(cfg: Any) -> Any:
+    """解析本次请求应使用的限速器;未启用 → ``None``(缺省,零行为变化)。
+
+    优先级::func:`set_default_rpm` 的进程级设置 > cfg 附加属性
+    ``provider_rpm``。后者在首次命中时惰性建桶并连同 rpm 一并记忆
+    (持锁,rpm 变化时重建),避免每个请求重复构造限速器。
+    """
+    if _THROTTLE is not None:
+        return _THROTTLE
+    rpm = getattr(cfg, "provider_rpm", None)
+    if rpm is None:
+        return None
+    try:
+        rpm_val = int(rpm)
+    except (TypeError, ValueError):
+        return None
+    if rpm_val < 1:
+        return None
+    global _CFG_THROTTLE, _CFG_THROTTLE_RPM
+    with _THROTTLE_LOCK:
+        if _CFG_THROTTLE is None or _CFG_THROTTLE_RPM != rpm_val:
+            from netsentinel.vision.provider_throttle import ProviderThrottle  # 惰性导入
+
+            _CFG_THROTTLE = ProviderThrottle(default_rpm=rpm_val)
+            _CFG_THROTTLE_RPM = rpm_val
+        return _CFG_THROTTLE
+
+
+def _throttle_acquire(provider: str, cfg: Any) -> None:
+    """真实外呼前取一个令牌;限速未启用(缺省)或取令牌异常时直接放行。
+
+    限速是礼貌性旁路:ProviderThrottle.acquire 内部按缺口 ``time.sleep``,
+    真实等待计入 ``telemetry.inc("throttle.waited")``;任何异常只告警、
+    绝不阻断传输主流程(与 quirks / 成本落账同款降级哲学)。
+
+    V10.18 可观测补齐(纯遥测,零行为变化):调用点额外按 ``acquire`` 的
+    返回值(本次等待秒数,0 = 立即获得)计 ``vision.throttle.wait`` 并
+    observe 同名等待时长,便于按提供方限速的排队情况定位。
+    """
+    throttle = _resolve_throttle(cfg)
+    if throttle is None:
+        return
+    try:
+        waited = throttle.acquire(provider)
+    except Exception as exc:  # noqa: BLE001 - 礼貌限速失败不得阻断真实外呼
+        logger.warning("每提供方限速取令牌失败(已放行,不影响调用):%s", exc)
+        return
+    if waited > 0.0:
+        telemetry.inc("vision.throttle.wait")
+        telemetry.observe("vision.throttle.wait", waited)
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +1121,9 @@ class UniversalVLMClient:
         serialized: bytes | None = None
         last_error: urllib.error.URLError | None = None
         for attempt in range(_MAX_TRANSPORT_ATTEMPTS):
+            # (A74)每提供方礼貌限速:默认禁用(零开销一次函数调用即返回);
+            # 启用后每次真实外呼尝试(含重试跳)前都先取令牌,超速阻塞等待。
+            _throttle_acquire(self.provider, self._cfg)
             try:
                 if use_default_transport:
                     if serialized is None:
@@ -1044,33 +1208,40 @@ class UniversalVLMClient:
         return parsed
 
     def _extract_content(self, document: dict) -> Any:
-        """按方言从 200 响应体中提取模型输出文本(或对象)。"""
-        snippet = self._scrub(json.dumps(document, ensure_ascii=False)[:200])
+        """按方言从 200 响应体中提取模型输出文本(或对象)。
+
+        (V17)错误片段 snippet 改为**仅失败分支构造**:原先每次成功提取也
+        先把整份响应体 ``json.dumps`` 一遍专为可能用到的片段,成功热路径
+        纯浪费;失败消息文本逐字符不变(同一 document、同一打码口径)。
+        """
+        def snippet() -> str:
+            return self._scrub(json.dumps(document, ensure_ascii=False)[:200])
+
         if self.style == STYLE_OPENAI:
             choices = document.get("choices")
             if not isinstance(choices, list) or not choices:
-                raise RuntimeError(f"提供方 {self.provider} 返回缺少 choices:{snippet}")
+                raise RuntimeError(f"提供方 {self.provider} 返回缺少 choices:{snippet()}")
             first = choices[0] if isinstance(choices[0], dict) else {}
             message = first.get("message") if isinstance(first, dict) else {}
             if not isinstance(message, dict) or "content" not in message:
-                raise RuntimeError(f"提供方 {self.provider} 返回缺少 message.content:{snippet}")
+                raise RuntimeError(f"提供方 {self.provider} 返回缺少 message.content:{snippet()}")
             return message["content"]
         if self.style == STYLE_ANTHROPIC:
             blocks = document.get("content")
             if not isinstance(blocks, list):
-                raise RuntimeError(f"提供方 {self.provider} 返回缺少 content:{snippet}")
+                raise RuntimeError(f"提供方 {self.provider} 返回缺少 content:{snippet()}")
             return "".join(
                 block.get("text", "") for block in blocks if isinstance(block, dict)
             )
         # gemini:candidates[0].content.parts[*].text 拼接
         candidates = document.get("candidates")
         if not isinstance(candidates, list) or not candidates:
-            raise RuntimeError(f"提供方 {self.provider} 返回缺少 candidates:{snippet}")
+            raise RuntimeError(f"提供方 {self.provider} 返回缺少 candidates:{snippet()}")
         first = candidates[0] if isinstance(candidates[0], dict) else {}
         content = first.get("content") if isinstance(first, dict) else {}
         parts = content.get("parts") if isinstance(content, dict) else None
         if not isinstance(parts, list):
-            raise RuntimeError(f"提供方 {self.provider} 返回缺少 content.parts:{snippet}")
+            raise RuntimeError(f"提供方 {self.provider} 返回缺少 content.parts:{snippet()}")
         return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
 
 

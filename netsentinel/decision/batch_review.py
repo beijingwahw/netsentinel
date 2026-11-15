@@ -47,6 +47,7 @@ from urllib.parse import urlparse
 from netsentinel import telemetry
 from netsentinel.contracts import Config, now_iso
 from netsentinel.logging_util import JsonlAuditLogger
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 if TYPE_CHECKING:  # 仅类型标注用,运行时惰性导入避免硬依赖
     from netsentinel.decision.review_queue import Entry
@@ -115,10 +116,10 @@ class BatchReview:
         self._audit_path = str(audit_path) if audit_path else ""
         self._audit: JsonlAuditLogger | None = None  # 惰性:首次声明时才创建
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = sqlite_connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # V10.21:连接统一经 storage.kernel.connect 工厂(全仓唯一
+        # sqlite3.connect 入口);WAL + 忙等 5s 由工厂内置,口径不变。
         self._conn.execute(_SCHEMA_SQL)
         self._conn.commit()
         logger.debug("批量声明台账已就绪:%s(审计:%s)", self.db_path, self._audit_path or "关闭")

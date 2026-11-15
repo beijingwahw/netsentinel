@@ -60,11 +60,16 @@ FetchPageFn = Callable[[str, Config], tuple[int, str, str]]
 
 _FETCHER_MODULE = "netsentinel.crawler.fetcher"
 
-#: 默认策略下放行的本机 host(与 fetcher 同语义)
-_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
+#: 默认策略下放行的本机 host(与 fetcher 同语义)。回环口径三处统一(修改
+#: 任何一处须同步):crawler/fetcher.py、crawler/browser.py、
+#: crawler/redirect.py——都认 127.0.0.1 / localhost / ::1;127.0.0.0/8 全段
+#: 由 fetcher 闸门(在席时的首选路径)经 ipaddress 判定放行。
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-#: fetcher 缺失时的本地兜底 User-Agent(正常情况惰性复用 fetcher.USER_AGENT)
-_FALLBACK_USER_AGENT = "NetSentinel/0.1"
+#: fetcher 缺失时的本地兜底 User-Agent(正常情况惰性复用 fetcher.USER_AGENT)。
+#: 与 crawler/fetcher.py 的 USER_AGENT、discovery/yandex.py 的 USER_AGENT 为
+#: 同一取值的三处副本(包间零依赖;修改任何一处须同步其余两处)。
+_FALLBACK_USER_AGENT = "NetSentinel/0.17"
 
 #: <meta ...> 标签及其 http-equiv/content 属性的识别(允许任意属性顺序/引号风格)
 _META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)

@@ -243,6 +243,7 @@ class FailoverClassifier(NsfwClassifier):
     """
 
     name = "failover"
+    consumes_vlm_budget = True  # P1-5:链成员为 VLM(外呼与记账由成员负责)
 
     def __init__(
         self,

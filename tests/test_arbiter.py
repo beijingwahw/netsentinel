@@ -527,3 +527,83 @@ def test_v5_budget_exhaustion_does_not_count_escalation(tel) -> None:
     counters = tel.snapshot()["counters"]
     assert counters["arbiter.disputes"] == 2.0
     assert counters["arbiter.escalated"] == 1.0  # 第二张 spend_one 抛预算异常,未外呼
+
+
+# ===========================================================================
+# V10.20 深度修复:vlm_prompts 模块内 bug 不再被无声吞掉
+# ===========================================================================
+
+
+class _BrokenVlmPromptsFinder:
+    """meta_path finder:拦截 vlm_prompts 导入并抛 RuntimeError(模拟模块内 bug)。"""
+
+    def find_spec(self, fullname, path=None, target=None):  # noqa: ANN001
+        if fullname == "netsentinel.vision.vlm_prompts":
+            raise RuntimeError("模拟 vlm_prompts 模块级初始化 bug")
+        return None
+
+
+def test_v10_broken_vlm_prompts_logs_debug_and_arbitration_completes(
+    monkeypatch, caplog
+) -> None:
+    """vlm_prompts 导入抛 RuntimeError:留一条 debug 日志可诊断,仲裁仍用缺省提示词完成。
+
+    回归 V10.20:原实现 ``except Exception: pass`` 连模块内 bug 也无声吞掉,
+    仲裁退回默认提示词后无从排查;收窄为 ImportError 静默、其余异常 debug 一条。
+    """
+    import logging
+    import sys
+
+    import netsentinel.vision as vision_pkg
+
+    # 让下一次 import vlm_prompts 走 import 机器并抛 RuntimeError:
+    # 移除 sys.modules 缓存与父包属性,再在最前面挂上坏 finder。
+    monkeypatch.delitem(sys.modules, "netsentinel.vision.vlm_prompts", raising=False)
+    monkeypatch.delattr(vision_pkg, "vlm_prompts", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BrokenVlmPromptsFinder(), *sys.meta_path])
+
+    e = make_ensemble_entry("a.jpg", 0.5)
+    members = [
+        make_member("a.jpg", "stub", 0.9),
+        make_member("a.jpg", "clip", 0.1),
+    ]
+    client, cache = FakeClient(), FakeCache()
+    with caplog.at_level(logging.DEBUG, logger="netsentinel.vision.arbiter"):
+        result = arbitrate([e], members, Config(), client=client, cache=cache)
+
+    # 仲裁仍完整走通:用内置缺省提示词完成替换
+    assert result[0].model == "vlm-arbiter"
+    assert result[0].nsfw_prob == pytest.approx(0.9)
+    assert client.calls == 1
+    # 且留下一条可诊断的 debug 日志(含异常信息)
+    debug_msgs = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+    ]
+    assert any("vlm_prompts" in m and "模拟 vlm_prompts 模块级初始化 bug" in m for m in debug_msgs)
+
+
+def test_v10_missing_vlm_prompts_import_error_stays_silent(monkeypatch, caplog) -> None:
+    """vlm_prompts 以 ImportError 缺席(正常并行开发场景):保持静默,不打 debug。"""
+    import logging
+    import sys
+
+    import netsentinel.vision as vision_pkg
+
+    monkeypatch.delitem(sys.modules, "netsentinel.vision.vlm_prompts", raising=False)
+    monkeypatch.delattr(vision_pkg, "vlm_prompts", raising=False)
+    # 把真实 finder 挡掉:让任何途径都只能得到 ImportError
+    monkeypatch.setattr(sys, "meta_path", [])
+
+    e = make_ensemble_entry("a.jpg", 0.5)
+    members = [
+        make_member("a.jpg", "stub", 0.9),
+        make_member("a.jpg", "clip", 0.1),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="netsentinel.vision.arbiter"):
+        result = arbitrate([e], members, Config(), client=FakeClient(), cache=FakeCache())
+
+    assert result[0].model == "vlm-arbiter"
+    debug_msgs = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+    ]
+    assert not any("vlm_prompts" in m for m in debug_msgs)

@@ -91,6 +91,20 @@ _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9.-]")
 
 #: host → 互斥锁注册表:同 safe_host 的构建整段串行化(防 A11 目录名
 #: "探测—创建" 竞争);注册表自身由守护锁保护。
+#:
+#: V10.18 有界化评估结论:**保持无界注册表**,论证如下——
+#: 1. 简单淘汰不安全:调用方在守护锁**外**才 acquire(fetch → return →
+#:    with __enter__ 之间存在窗口)。若另一线程在窗口内以
+#:    ``acquire(blocking=False)`` 探得该锁"空闲"而将其删除,同 host 的
+#:    后续线程会重建新锁——两线程各持不同锁并发构建,串行化保证被击穿。
+#:    要彻底消除该竞态须引入引用计数并在 with 退出时归还,属取用协议
+#:    变更;而 test_host_lock_registry_keyed_by_safe_host 已冻结
+#:    "同 host 返回同一锁对象" 的同一性契约,淘汰后同 host 可观测到
+#:    不同锁对象,行为不等价。
+#: 2. 无界增长实际有界:单条目 ≈ 键串 + threading.Lock ≈ 200 量级字节;
+#:    单次 pack_all 受 :data:`MAX_BATCH`(512)硬上限,进程生命周期内
+#:    累积条目数 = 处理过的不同 safe_host 数(万级站点 ≈ 个位数 MB),
+#:    远不构成内存压力;锁本身无关联后台资源,残留仅是字典槽位。
 _HOST_LOCKS: dict[str, threading.Lock] = {}
 _HOST_LOCKS_GUARD = threading.Lock()
 
@@ -100,7 +114,13 @@ _HOST_LOCKS_GUARD = threading.Lock()
 # ---------------------------------------------------------------------------
 def _safe_host(site_url: str) -> str:
     """提取站点主机名并替换非法字符(镜像 A11 ``packager._safe_host``,
-    不依赖其私有符号);取不到主机名时返回 ``unknown``。"""
+    不依赖其私有符号);取不到主机名时返回 ``unknown``。
+
+    镜像实现锁:与 evidence/packager.py 的 ``_safe_host`` 必须逐字符一致
+    (锁键 = A11 目录前缀,测试 test_parallel_pack 已锁定);crawler/browser.py
+    另有一份同款清洗(取 netloc 含端口,口径不同)。修改字符集/兜底值
+    须三处同步评估。
+    """
     host = urllib.parse.urlparse(site_url).hostname or ""
     cleaned = _UNSAFE_CHARS.sub("_", host).rstrip(".")
     return cleaned or "unknown"

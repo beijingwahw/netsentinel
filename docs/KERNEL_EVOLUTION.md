@@ -751,9 +751,35 @@ if cfg.use_reliability_fusion:
 | telemetry_export | `telemetry.snapshot()` | `render_metrics()` 直通导出;service 挂 `/metrics` 属运营者自由扩展(service 不改) |
 | threat_kernel | CI / 发布前 | `python -m netsentinel.security.threat_kernel`(main CLI),退出码 2 即有新发现违规 |
 
-### 5.5 不变式(接入后仍须成立)
+### 5.5 SPRT 实时早停运行时(V10.38,P2-6 落地)
 
-- 任何开关组合下,**既有 2790 项测试不改一行应全绿**(红线 29);
+V7 时代 SPRT 是**事后演算**(`next_images` 消费已算好的分数做省预算演示);
+V10.38 起成为**生产运行时**——接线点、门禁与账目如下:
+
+- **激活条件(`cfg.use_sprt = true` 且仅默认流水线路径)**:内核门禁执行器
+  `vision/kernel_gate.py` **三道锁**全过——①测量锁:`calibration report`
+  落的机读 JSON(`<data_dir>/calibration/report_<模型>.json`)五判据全过
+  且模型 == 当前主分类器;②批准锁:运营者显式
+  `python -m netsentinel.vision.calibration approve --kernel sprt`;③指纹锁:
+  批准绑定的 `gate_digest` 与当前报告一致(重测自动失效)。任何一环缺失 =
+  **响亮降级**(全量送审旧行为 + `intel["sprt"].active=false` + 理由 +
+  `sprt.gate.refused` 计数)——「不开」而非「不许扫」。
+- **运行时语义**:站级 `SPRT(sprt_alpha, sprt_beta)` 随流水线**已完成分块**
+  增量判停( Wald 吸收态:吸收点即 n_used);判停 → 停止爬取 + 取消未起跑
+  分块(在飞分块照收,浪费有界=单分块);**带内错误分(0.0 哨兵)绝不喂**
+  (失败不是证据);`vlm_max_images_per_site` 成为真实站级送审上界
+  (超出截下 + 预算满停爬);多成员集成未测不开(保守边界)。
+- **判定零触碰**:SPRT 只决定「还送不送」,不改「怎么判」——assess 阈值 /
+  needs_review / 聚合公式原样;`min_nsw_images=3` ≤ Wald nsfw 停审下限 6,
+  强站判定一致性有构造保证(实测 18→8 张调用,verdict/agg 逐项一致)。
+- **账目(`report.intel["sprt"]`,仅 use_sprt 开启时出现)**:`active /
+  verdict / n_used / images_sent / budget_cap / budget_saved / stopped_early /
+  stop_reason`;kernel_wire 的事后演算见到 `active` 键不覆写(单一事实源)。
+
+### 5.6 不变式(接入后仍须成立)
+
+- 任何开关组合下,**既有测试不改一行应全绿**(红线 29;V10.38 时全量
+  ~7500 项);
 - 任何学习型内核不发起网络请求、不外发任何文本/图片(红线 30 + 各模块
   遥测只存名称与数字的红线 17);
 - 任何 bench 断言在任何机器上重复运行结果一致(红线 31)。

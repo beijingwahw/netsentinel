@@ -77,7 +77,7 @@ def test_run_rows_exact_keys_and_field_values() -> None:
     assert row["batch"] == "session_20261002_133347"
     assert row["sites"] == 12
     assert isinstance(row["sites"], int)
-    assert row["verdict_cn"] == "未发现 7 / 疑似 2 / 高置信 3"
+    assert row["verdict_cn"] == "未见违规 7 / 疑似 2 / 高置信 3"
     assert row["groups"] == 4
     assert row["tier_badge"] == BADGE_MID == "🟡 中(默认)"
     assert row["ready"] == 5
@@ -243,21 +243,21 @@ def test_advice_tier_matches_advice_thresholds_and_duck_profile() -> None:
 
 
 def test_dist_line_chinese_labels_full_three() -> None:
-    """三键齐全 → "未发现 2 / 疑似 1 / 高置信 3"(中文标签 + " / " 连接)。"""
-    assert dist_line({"clean": 2, "suspect": 1, "nsfw": 3}) == "未发现 2 / 疑似 1 / 高置信 3"
-    assert VERDICT_LABELS_CN == {"clean": "未发现", "suspect": "疑似", "nsfw": "高置信"}
+    """三键齐全 → "未见违规 2 / 疑似 1 / 高置信 3"(中文标签 + " / " 连接)。"""
+    assert dist_line({"clean": 2, "suspect": 1, "nsfw": 3}) == "未见违规 2 / 疑似 1 / 高置信 3"
+    assert VERDICT_LABELS_CN == {"clean": "未见违规", "suspect": "疑似", "nsfw": "高置信"}
 
 
 def test_dist_line_fixed_order_regardless_of_input_order() -> None:
     """输出顺序固定 clean→suspect→nsfw(由轻到重),与入参键序无关。"""
-    assert dist_line({"nsfw": 3, "clean": 2, "suspect": 1}) == "未发现 2 / 疑似 1 / 高置信 3"
+    assert dist_line({"nsfw": 3, "clean": 2, "suspect": 1}) == "未见违规 2 / 疑似 1 / 高置信 3"
     assert dist_line({"suspect": 1}) == "疑似 1"
-    assert dist_line({"nsfw": 1, "clean": 1}) == "未发现 1 / 高置信 1"
+    assert dist_line({"nsfw": 1, "clean": 1}) == "未见违规 1 / 高置信 1"
 
 
 def test_dist_line_keeps_zeros_and_unknown_keys() -> None:
     """计数 0 如实展示;未知档位键原样保留(追加在已知三档之后)。"""
-    assert dist_line({"clean": 0, "suspect": 0, "nsfw": 0}) == "未发现 0 / 疑似 0 / 高置信 0"
+    assert dist_line({"clean": 0, "suspect": 0, "nsfw": 0}) == "未见违规 0 / 疑似 0 / 高置信 0"
     assert dist_line({"nsfw": 2, "weird": 1}) == "高置信 2 / weird 1"
     assert dist_line({"other": 5}) == "other 5"
 
@@ -268,7 +268,7 @@ def test_dist_line_defaults_for_empty_or_bad_input() -> None:
     assert dist_line(None) == "无数据"
     assert dist_line(42) == "无数据"  # type: ignore[arg-type]
     assert dist_line("clean=1") == "无数据"  # type: ignore[arg-type]
-    assert dist_line({"clean": "许多"}) == "未发现 0"
+    assert dist_line({"clean": "许多"}) == "未见违规 0"
 
 
 # ---------------------------------------------------------------------------

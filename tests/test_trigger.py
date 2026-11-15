@@ -477,3 +477,40 @@ class TestEnsureSetupDefaultFactory:
         stub_keys(monkeypatch, {})
         with pytest.raises(RuntimeError, match="连接向导服务未就位"):
             trigger.ensure_setup(make_cfg(tmp_path), open_browser=False)
+
+
+# ---------------------------------------------------------------------------
+# V10.20:_announce 库链路 print 可注入化(sink 注入 + logger.info)
+# ---------------------------------------------------------------------------
+class TestV1020AnnounceSink:
+    """sink 注入捕获提示文案;缺省仍 print(flush);sink 故障只告警。"""
+
+    def test_injected_sink_receives_chinese_message(self) -> None:
+        got: list[str] = []
+        trigger._announce(URL, should_open=False, sink=got.append)
+        assert got == [f"未检测到视觉模型,连接向导已启动:{URL}"]
+
+    def test_default_sink_still_prints_with_flush(self, capsys) -> None:
+        trigger._announce(URL, should_open=False)
+        out = capsys.readouterr().out
+        assert URL in out and "未检测到视觉模型" in out
+
+    def test_sink_exception_swallowed_not_raised(self) -> None:
+        def boom(message: str) -> None:
+            raise RuntimeError("sink 坏了(测试注入)")
+
+        # 通知是辅助动作:sink 抛异常绝不外传、不影响主流程
+        trigger._announce(URL, should_open=False, sink=boom)
+
+    def test_message_also_logged_via_logger_info(self, caplog) -> None:
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="netsentinel.setup.trigger"):
+            trigger._announce(URL, should_open=False, sink=lambda _m: None)
+        assert any("连接向导" in rec.message for rec in caplog.records)
+
+    def test_opened_browser_skips_sink(self, monkeypatch) -> None:
+        got: list[str] = []
+        monkeypatch.setattr(trigger.webbrowser, "open", lambda _u: True)
+        trigger._announce(URL, should_open=True, sink=got.append)
+        assert got == []  # 已弹窗,无需文字提示

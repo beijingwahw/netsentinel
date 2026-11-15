@@ -503,16 +503,19 @@ def test_v9_louvain_empty_single_and_edgeless() -> None:
 
 
 def test_v9_louvain_fully_connected_graphs() -> None:
-    """全连通图:等权 K5 的模块度最优解即全单点(已知偏置,正确行为);
-    权重分层的全连通图(组内强 / 组间弱)正确切出两社区。"""
+    """全连通图:等权 K5 的标准模块度最优解即整图归一(V10.20 修复内部项
+    因子 2 后的正确行为);权重分层的全连通图(组内强 / 组间弱)正确切出两社区。"""
     complete = {c: {} for c in "abcde"}
     for i, a in enumerate("abcde"):
         for b in "abcde"[i + 1:]:
             complete[a][b] = 1.0
     partition = louvain_communities(complete)
-    assert len(set(partition.values())) == 5  # 等权完全图:单点即最优(Q 不降)
+    assert len(set(partition.values())) == 1  # 等权完全图:整图归一即最优
     q_singleton = louvain_modularity(complete, _singleton_partition(complete))
-    assert louvain_modularity(complete, partition) == pytest.approx(q_singleton)
+    assert louvain_modularity(complete, partition) == pytest.approx(
+        louvain_modularity(complete, {c: 0 for c in "abcde"})
+    )
+    assert louvain_modularity(complete, partition) > q_singleton
 
     # 全连通但权重分层:8 点完全图,组内边权 5.0、组间边权 1.0
     weighted: dict[str, dict[str, float]] = {}
@@ -573,8 +576,10 @@ def test_v9_louvain_params_and_stats() -> None:
     for i, a in enumerate("abcde"):
         for b in "abcde"[i + 1:]:
             complete[a][b] = 1.0
-    fine = louvain_communities(complete, resolution=0.4)  # 低分辨率 → 归一
-    coarse = louvain_communities(complete, resolution=1.0)  # 默认 → 全单点
+    # V10.20 修复后 K5 在默认 resolution=1.0 下整图归一(标准模块度最优);
+    # 提高分辨率(2.0)惩罚项压过内部收益 → 全单点,社区变细。
+    fine = louvain_communities(complete, resolution=1.0)
+    coarse = louvain_communities(complete, resolution=2.0)
     assert len(set(fine.values())) < len(set(coarse.values()))
 
     stats: dict[str, int] = {}
@@ -634,3 +639,46 @@ def test_v9_louvain_self_loop_and_zero_weights() -> None:
     assert louvain_modularity(with_loop, {"a": 0, "b": 1, "c": 2}) == pytest.approx(
         louvain_modularity(with_loop, {"a": 0, "b": 1, "c": 2}, resolution=1.0)
     )
+
+
+def test_v10_louvain_internal_weight_factor_regression() -> None:
+    """V10.20 因子 2 修复回归:标准模块度中社区内边计入两次(Σ_ij 双向),
+    修复前 louvain_pass 增益与 louvain_modularity 内部项均漏乘 2,导致
+    三角形 / 等权完全图 / 单边二点图等强社区结构被系统性拆成单点。"""
+
+    # 1) 三角形(最强社区信号)整图归一,模块度严格优于任何拆分
+    tri = {"a": {"b": 1.0, "c": 1.0}, "b": {"c": 1.0}}
+    assert louvain_communities(tri) == {"a": 0, "b": 0, "c": 0}
+    q_merged = louvain_modularity(tri, {"a": 0, "b": 0, "c": 0})
+    q_split = louvain_modularity(tri, {"a": 0, "b": 0, "c": 1})
+    assert q_merged == pytest.approx(0.0)
+    assert q_merged > q_split
+
+    # 2) 单边二点图:合并 ΔQ = +0.5 > 0,必须并团(修复前净增益恒 0 不并)
+    assert louvain_communities({"a": {"b": 1.0}}) == {"a": 0, "b": 0}
+    assert louvain_pass({"a": {"b": 1.0}}) == {"a": 0, "b": 0}
+
+    # 3) 四点环切分为两对(与整图归一同为 Q=0 的并列最优,均严格优于
+    #    全单点 Q=-0.25;修复前贪心增益恒 0 连一次合并都不发生)
+    square = {
+        "a": {"b": 1.0},
+        "b": {"c": 1.0},
+        "c": {"d": 1.0},
+        "d": {"a": 1.0},
+    }
+    part = louvain_communities(square)
+    assert len(set(part.values())) == 2
+    assert part["a"] == part["b"] and part["c"] == part["d"]
+    assert part["a"] != part["c"]
+    assert louvain_modularity(square, part) == pytest.approx(0.0)
+    assert louvain_modularity(square, part) > louvain_modularity(
+        square, _singleton_partition(square)
+    )
+
+    # 4) 模块度数值与标准公式逐点对齐(K5 整图归一 Q=0;全单点 Q=-0.2)
+    comp = {c: {} for c in "abcde"}
+    for i, a in enumerate("abcde"):
+        for b in "abcde"[i + 1 :]:
+            comp[a][b] = 1.0
+    assert louvain_modularity(comp, {c: 0 for c in "abcde"}) == pytest.approx(0.0)
+    assert louvain_modularity(comp, _singleton_partition(comp)) == pytest.approx(-0.2)

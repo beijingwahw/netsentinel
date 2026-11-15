@@ -137,7 +137,6 @@ trace_id(测试覆盖);跨线程贯通**必须**显式 :func:`propagate` →
 from __future__ import annotations
 
 import contextvars
-import datetime as _dt
 import secrets
 import threading
 import time
@@ -147,7 +146,7 @@ from functools import wraps
 from importlib import import_module
 from typing import Any, Callable, Iterator, Mapping
 
-from netsentinel import telemetry
+from netsentinel import telemetry, timesource
 
 __all__ = [
     "TRACE_ID_HEX_LEN",
@@ -266,12 +265,14 @@ class TraceSnapshot:
 
 
 def _now_iso() -> str:
-    """当前本地时区 ISO 时间戳(毫秒精度;与 telemetry.snapshot 同风格)。"""
-    return (
-        _dt.datetime.now(_dt.timezone.utc)
-        .astimezone()
-        .isoformat(timespec="milliseconds")
-    )
+    """当前本地时区 ISO 时间戳(毫秒精度;与 telemetry.snapshot 同风格)。
+
+    V10.24 收编:原 aware 惯用式 ``datetime.now(timezone.utc).astimezone()
+    .isoformat(timespec="milliseconds")`` 逐字符等价于
+    ``timesource.now_iso(timespec="milliseconds")``(同一惯用式的单源化,
+    见 :mod:`netsentinel.timesource` 等价性承诺)。
+    """
+    return timesource.now_iso(timespec="milliseconds")
 
 
 def _make_id(nbytes: int) -> str:

@@ -4,9 +4,12 @@
 首个计划启动 chromium 并保留 BrowserContext,后续计划仅 ``context.new_page()``,
 把「每计划一次浏览器冷启动」摊薄为「每会话一次」(对应 ``browser_session_reuse``)。
 
-与 :mod:`netsentinel.submit.executor_playwright` 的关系(零语义漂移,不改其一行):
+与 :mod:`netsentinel.submit.executor_playwright` 的关系(零语义漂移,不改其
+对外 API):
 - 逐步语义(GOTO/WAIT/SELECT/FILL/CLICK/SCREENSHOT/HUMAN_GATE 与 submitted 判定、
-  截图窄捕获)直接 import 复用其私有辅助 ``_perform_step`` / ``_screenshot_error_types``;
+  截图窄捕获)经共享私有编排 ``_run_plan_steps`` 复用(V17 · G5 由重复循环
+  提取):其内部再委托 ``_perform_step`` 解释单步,步骤循环、取消/错误文案与
+  "计划执行完毕"收尾在两执行器间逐字同源;
 - ``dry_run`` 分支原样委托 :func:`executor_playwright.execute`(纯标准库、零三方依赖,
   notes 文案一字不差);
 - 本模块只新增「会话生命周期」:一次 launch、逐计划 new_page、页失败隔离、幂等 close。
@@ -45,16 +48,15 @@ bench(红线 31,见 tests/test_executor_session.py::test_v7_bench_*):
 """
 from __future__ import annotations
 
-import datetime as _dt
 import logging
 import pathlib
 from typing import Any, Callable
 
 from netsentinel import telemetry
+from netsentinel import timesource
 from netsentinel.contracts import Config, ExecutionResult, SubmissionPlan
 from netsentinel.submit.executor_playwright import (
-    _perform_step,
-    _screenshot_error_types,
+    _run_plan_steps,
     execute as _execute_plan,
 )
 
@@ -186,7 +188,7 @@ class SessionExecutor:
     def _next_out_dir(self) -> pathlib.Path:
         """本会话内逐计划独立输出目录:runs/session_<ts>/plan001、plan002、…。"""
         if self._session_root is None:
-            stamp = _dt.datetime.now().strftime(_RUN_TS_FORMAT)
+            stamp = timesource.now_local().strftime(_RUN_TS_FORMAT)
             self._session_root = (
                 pathlib.Path(self._cfg.data_dir) / "runs" / f"session_{stamp}"
             )
@@ -289,53 +291,18 @@ class SessionExecutor:
             logger.warning("新建页面失败(会话已销毁,下个计划将重建):%s", exc)
             return result
 
-        shot_errors = _screenshot_error_types()
+        # V17(G5):步骤循环编排复用 executor_playwright._run_plan_steps,
+        # 两执行器的逐步 notes / 取消 / 错误 / 收尾文案逐字同源;
+        # V10.20:证据池感知去重开关与 playwright 执行器同源取 cfg
         try:
-            completed = True
-            for idx, step in enumerate(plan.steps, start=1):
-                stopped_label = step.label or f"step{idx}:{step.action.value}"
-                try:
-                    _perform_step(
-                        step,
-                        page=page,
-                        out_path=out_path,
-                        idx=idx,
-                        result=result,
-                        auto_confirm=auto_confirm,
-                        shot_errors=shot_errors,
-                    )
-                except KeyboardInterrupt:
-                    # 人工门处 Ctrl+C = 人工主动取消(文案与 executor_playwright 一致)
-                    result.ok = False
-                    result.stopped_at = stopped_label
-                    result.notes.append(
-                        f"[取消] 第{idx}步 人工取消(Ctrl+C):{stopped_label}"
-                    )
-                    logger.info(
-                        "人工取消:portal=%s stopped_at=%s", plan.portal.value, stopped_label
-                    )
-                    completed = False
-                    break
-                except Exception as exc:  # noqa: BLE001 - 步骤失败:本计划止步,会话保留
-                    telemetry.inc(_METRIC_ERRORS)
-                    result.ok = False
-                    result.stopped_at = stopped_label
-                    result.notes.append(
-                        f"[错误] 第{idx}步({step.action.value} {step.label}):{exc}"
-                    )
-                    logger.warning("步骤失败(%s):%s", stopped_label, exc)
-                    completed = False
-                    break
-
-            if completed:
-                result.ok = True
-                result.notes.append(f"计划执行完毕:共 {len(plan.steps)} 步")
-                logger.info(
-                    "计划执行完毕:portal=%s submitted=%s screenshots=%d",
-                    plan.portal.value,
-                    result.submitted,
-                    len(result.screenshots),
-                )
+            _run_plan_steps(
+                plan,
+                page=page,
+                out_path=out_path,
+                result=result,
+                auto_confirm=auto_confirm,
+                dedup=bool(getattr(self._cfg, "evidence_pool_dedup", True)),
+            )
             return result
         finally:
             # 页失败不影响会话:无论成败只关本计划的页面,context/browser 保留

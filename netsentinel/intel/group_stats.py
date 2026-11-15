@@ -311,14 +311,17 @@ def export_csv(groups: Iterable[Any] | None, path: str | Path) -> int:
             writer = csv.writer(fh)
             writer.writerow(CSV_HEADER)
             for group in groups:
+                # V10.18:去重别名域每行只算一次(纯函数,两次调用结果恒等;
+                # 站点数列与 aliases 列共用,大组场景减半每行开销)
+                hosts = _hosts_of(group)
                 writer.writerow(
                     [
                         _name_of(group),
-                        len(_hosts_of(group)),  # 站点数 = 去重别名域个数
+                        len(hosts),  # 站点数 = 去重别名域个数
                         len(_seq_of(group, "site_urls")),  # URL 数
                         _verdict_label(group),
                         str(_agg_of(group)),
-                        ";".join(_hosts_of(group)),
+                        ";".join(hosts),
                     ]
                 )
                 written += 1

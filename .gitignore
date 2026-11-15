@@ -7,3 +7,13 @@ out/
 *.zip
 *.tar.gz
 .venv/
+
+# 敏感配置(含密钥/个人信息/巡查目标,勿入库;*.example* 模板文件不受影响)
+config.yaml
+profile.yaml
+watchlist.yaml
+keywords.txt
+leads*.txt
+
+# README 预览产生的 Edge 浏览器缓存
+docs/assets/.edge-preview/

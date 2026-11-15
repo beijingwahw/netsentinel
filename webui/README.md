@@ -4,6 +4,20 @@ Streamlit Web 复核台:机器初筛 → **人工复核** → 辅助举报流程
 运营者在浏览器里查看证据、查看 GLM/规则解释,逐条批准或驳回,并可在批准后本地预览
 举报计划(playbook)。本页面**绝不自动提交举报**。
 
+## 同目录其他页面(各自独立入口)
+
+| 页面 | 启动 | 一句话定位 |
+| --- | --- | --- |
+| dashboard.py | `streamlit run webui/dashboard.py` | 运营仪表盘(趋势/模型一致性/站点关联/政策预演) |
+| keywords_page.py | `streamlit run webui/keywords_page.py` | 关键词工作台:发现搜索词实时编辑/词组库一键切换(`<data>/keywords/`,纯本地零外呼) |
+| providers_page.py | `streamlit run webui/providers_page.py` | 提供方面板(20 家总表/探活/成本/贝叶斯权重) |
+| groups_page.py | `streamlit run webui/groups_page.py` | 分组复核页(组详情/批量声明留痕) |
+| models_page.py | `streamlit run webui/models_page.py` | 模型页(活动模型/本地服务/密钥掩码) |
+| runs_page.py | `streamlit run webui/runs_page.py` | 最近运行页(批次收官汇总/CPU 建议) |
+| draft_flow_page.py | `streamlit run webui/draft_flow_page.py` | 门户草稿工作流页(扫描→逐字段确认→口令落位) |
+| assistant_page.py | `streamlit run webui/assistant_page.py` | 净网助手:发现→扫描→复核一站式控制台(所有操作经本机 REST `127.0.0.1:8765` 后台执行,页面只手动轮询展示;唯一弹窗 = 显式点击的验证会话窗口) |
+| label_page.py | `streamlit run webui/label_page.py` | 标注工作台:校准标注集人工标注(看图点击 clean/nsfw,`human:webui` 溯源,门禁 C1 正/负样本 ≥20 实时进度;补充语料 pending 入口 + 整组导入正/负样本目录入口 `human:dir-import`(确认门,已标绝不覆盖);零模型调用、与 CLI `calibration label`/`import` 读写同一 JSONL) |
+
 ## 启动
 
 ```bash

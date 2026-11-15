@@ -54,6 +54,7 @@ __all__ = [
     "model_rows",
     "render",
     "switch_banner",
+    "switch_row_key",
 ]
 
 # ===========================================================================
@@ -291,6 +292,21 @@ def can_switch(spec: str | None) -> bool:
     return True
 
 
+def switch_row_key(idx: int) -> str:
+    """本地服务表"切换到此模型"按钮的控件 key(V10.20 形式化;纯逻辑层)。
+
+    行索引在**单次扫描结果**内唯一(``model_rows`` 去重保序后按序枚举),
+    重新扫描后 session 状态随索引位移属预期(按钮点击消费的是当轮渲染的
+    行内容,不存在错位)。唯一性由 tests/test_webui_key_audit.py 锁定。
+
+    示例::
+
+        >>> switch_row_key(0)
+        'models_page_switch_0'
+    """
+    return f"models_page_switch_{int(idx)}"
+
+
 # ===========================================================================
 # UI 层(以下代码仅在 streamlit 运行时执行;兄弟模块一律函数内导入)
 # ===========================================================================
@@ -401,7 +417,9 @@ def _render_local_services(cfg: Any, active: str | None) -> None:
             f"视觉模型 {row['vision_count']} 个:{model_text}"
         )
         if row["models"]:
-            if right.button("切换到此模型", key=f"models_page_switch_{idx}", disabled=row["is_active"]):
+            if right.button(
+                "切换到此模型", key=switch_row_key(idx), disabled=row["is_active"]
+            ):
                 _do_switch(cfg, f"{row['provider']}:{row['models'][0]}")
         else:
             right.caption("(无可切换)")
@@ -504,4 +522,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    # V10.20(SystemExit 收尾修复,同 webui/app.py):streamlit 脚本线程内
+    # 不抛 SystemExit(BaseException 会杀死脚本线程,AppTest 通道失效);
+    # 仅真直跑才转进程退出码(保留缺依赖提示退出码 1 契约)。
+    _in_script_thread = False
+    if _HAS_ST:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+            _in_script_thread = get_script_run_ctx() is not None
+        except Exception:  # noqa: BLE001 - 内部 API 缺席按直跑处理
+            _in_script_thread = False
+    if not _in_script_thread:
+        raise SystemExit(_exit_code)

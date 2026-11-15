@@ -89,6 +89,7 @@ __all__ = [
     "DraftBundle",
     "draft_parse",
     "DraftConfirmFlow",
+    "field_confirm_key",
     "persist_draft",
     "placed_notice",
     "confirm_enable_portal",
@@ -153,6 +154,27 @@ _FIELD_ROW_KEYS: tuple[str, ...] = (
     "control",
     "manual_required",
 )
+
+
+#: 字段确认勾选框的控件键前缀(field_confirm_key 与重扫清理共用同一来源)。
+_FIELD_CONFIRM_PREFIX = "draft_confirm_"
+
+
+def field_confirm_key(field_key: str) -> str:
+    """字段人工确认勾选框的控件 key(V10.20 形式化;纯逻辑层)。
+
+    字段键的唯一性由 :class:`DraftConfirmFlow` 构造校验保证(重复键中文
+    ValueError),因此 ``draft_confirm_{字段键}`` 在单份草稿内恒唯一;
+    重扫新草稿时 UI 会先清空全部 :data:`_FIELD_CONFIRM_PREFIX` 前缀的
+    session 键(见 ``_render_scan``),陈旧勾选不会带入。唯一性由
+    tests/test_webui_key_audit.py 锁定。
+
+    示例::
+
+        >>> field_confirm_key("portal_field__url")
+        'draft_confirm_portal_field__url'
+    """
+    return _FIELD_CONFIRM_PREFIX + str(field_key)
 
 
 @dataclass
@@ -735,7 +757,8 @@ _SS_FLOW = "draft_flow_flow"
 _SS_SLUG = "draft_flow_slug"
 _SS_TARGET = "draft_flow_target"
 _SS_ENABLE_PHRASE = "draft_flow_enable_phrase"
-_SS_CONFIRM_PREFIX = "draft_confirm_"
+#: 字段勾选键前缀(与 :func:`field_confirm_key` 同源,用于重扫时批量清理)。
+_SS_CONFIRM_PREFIX = _FIELD_CONFIRM_PREFIX
 
 
 def _render_scan() -> None:
@@ -859,7 +882,7 @@ def _render_confirm() -> None:
         key = row["key"]
         star = " ⭐高置信" if row["confidence"] >= 0.90 else ""
         label = f"{key} — {row['status_cn']}(置信度 {row['confidence']:.2f}{star})"
-        checked = st.checkbox(label, value=False, key=f"{_SS_CONFIRM_PREFIX}{key}")
+        checked = st.checkbox(label, value=False, key=field_confirm_key(key))
         try:
             if checked and not flow.is_confirmed(key):
                 flow.confirm_field(key)
@@ -1005,4 +1028,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    # V10.20(SystemExit 收尾修复,同 webui/app.py):streamlit 脚本线程内
+    # 不抛 SystemExit(BaseException 会杀死脚本线程,AppTest 通道失效);
+    # 仅真直跑才转进程退出码(保留缺依赖提示退出码 1 契约)。
+    _in_script_thread = False
+    if _HAS_ST:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+            _in_script_thread = get_script_run_ctx() is not None
+        except Exception:  # noqa: BLE001 - 内部 API 缺席按直跑处理
+            _in_script_thread = False
+    if not _in_script_thread:
+        raise SystemExit(_exit_code)

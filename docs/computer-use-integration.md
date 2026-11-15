@@ -137,7 +137,7 @@ export async function callTool(name, args) {
 // 标题:冒烟验证 computer-use 适配模块是否可加载
 // 1) 用绝对 file:// URL 引入本仓库内的适配模块(bare specifier 不解析):
 const { pathToFileURL } = await import('node:url');
-const mod = await import(pathToFileURL('C:/1/netsentinel/drivers/my-dsh-client.mjs').href);
+const mod = await import(pathToFileURL('D:/3/netsentinel/drivers/my-dsh-client.mjs').href);
 // 2) 约定的最小接口:
 typeof mod.callTool; // 期望 'function'
 // 3) 冒烟(联调后才会真正成功;失败即视为"plugin 引擎不可用"):

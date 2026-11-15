@@ -437,12 +437,15 @@ def louvain_pass(
             for other, weight in neighbor_of[node].items():
                 com = community[other]
                 weights_to_com[com] = weights_to_com.get(com, 0.0) + weight
-            # 各候选社区的插入得分:ΔQ(c) ∝ w_ic − 2·res·Σ_tot,c·k_i / 2m
-            # (推导:ΔQ_c = (w_ic + s_i)/T − res·(2Σ_tot,c·k_i + k_i²)/T²,
-            #  T = 2m;s_i 与 k_i² 与候选无关可省;净增量 = score 差 / T)。
+            # 各候选社区的插入得分:ΔQ(c) ∝ 2/T·(w_ic − res·Σ_tot,c·k_i/T)
+            # (推导:ΔQ_c = (2·w_ic + 2·s_i)/T − res·(2Σ_tot,c·k_i + k_i²)/T²,
+            #  T = 2m;s_i 与 k_i² 与候选无关可省;净增量 = 2/T·score 差。
+            #  V10.20 修复:内部边权项此前漏乘 2(标准模块度中社区内边
+            #  计入两次),导致三角形/完全图等强社区被系统性拆散——
+            #  与 louvain_modularity 的同源修复成对出现。)
             home_score = (
                 weights_to_com.get(home, 0.0)
-                - 2.0 * resolution * sigma_tot[home] * degree[node] / total_two_m
+                - resolution * sigma_tot[home] * degree[node] / total_two_m
             )
             best_com, best_score = home, home_score
             for com in sorted(weights_to_com):  # 社区键升序:平局取最小
@@ -450,7 +453,7 @@ def louvain_pass(
                     continue
                 score = (
                     weights_to_com[com]
-                    - 2.0 * resolution * sigma_tot[com] * degree[node] / total_two_m
+                    - resolution * sigma_tot[com] * degree[node] / total_two_m
                 )
                 gain_evals += 1
                 if score > best_score:  # 严格更优才换(平局保持先到者)
@@ -459,7 +462,7 @@ def louvain_pass(
             sigma_tot[best_com] += degree[node]
             if best_com != home:
                 moved += 1
-                sweep_gain += (best_score - home_score) / total_two_m
+                sweep_gain += 2.0 * (best_score - home_score) / total_two_m
         total_moves += moved
         if moved == 0 or sweep_gain < threshold:
             break
@@ -597,7 +600,11 @@ def louvain_modularity(
     quality = 0.0
     for label in sorted(sigma_tot, key=repr):  # 确定性求和顺序
         internal = sigma_in.get(label, 0.0)
-        quality += internal / total_two_m - resolution * (
+        # V10.20 修复:社区内边在标准模块度中计入两次(Σ_ij 双向求和),
+        # 内部项应为 2·Σ_in/2m;此前漏乘 2 使强社区被系统性低估并拆散
+        # (与 louvain_pass 增益公式的同源修复成对出现)。自环计入
+        # Σ_in 一次、计入度两次的口径不变。
+        quality += 2.0 * internal / total_two_m - resolution * (
             sigma_tot[label] / total_two_m
         ) ** 2
     return quality

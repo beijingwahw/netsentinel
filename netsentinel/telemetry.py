@@ -20,7 +20,6 @@
 """
 from __future__ import annotations
 
-import datetime as _dt
 import json
 import threading
 import time
@@ -28,6 +27,8 @@ from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+from netsentinel import timesource
 
 __all__ = [
     "MAX_SAMPLES",
@@ -120,9 +121,7 @@ def snapshot() -> dict[str, Any]:
     """当前全部指标的只读汇总(计数器原值、计时器统计为毫秒)。"""
     with _LOCK:
         return {
-            "ts": _dt.datetime.now(_dt.timezone.utc)
-            .astimezone()
-            .isoformat(timespec="seconds"),
+            "ts": timesource.now_iso(),
             "counters": dict(_COUNTERS),
             "gauges": dict(_GAUGES),
             "timers": {name: _stats(list(s)) for name, s in _TIMERS.items()},

@@ -82,6 +82,14 @@ A236 窗口→executor 重建闭环 + 进程路径 worker 时长回传(可选,�
   异常就地转数据,错误文案与线程形态 ``str(exc)`` 一致;外层 summary
   形状逐字节不变)。线程池形态仍走 A212 适配器,零变化。
 
+G4 创世纪升级波(2026-10-13):提交侧未完成计数 O(1) 化——``_run_shard``
+改用 :class:`_PendingGauge`(提交 +1 / future done 回调 −1 / 读一次 O(1))
+取代逐个扫 ``futures`` 判 ``fut.done()`` 的计数(V10.12 静态路径"数到
+阈值+1 早退"仍为 O(backlog),aimd 路径为 O(已提交数)全量扫描);静态
+背压与 AIMD 两路径共用同一读数,阈值比较的布尔语义、停顿时长与既有
+停顿序列断言零变化(计数器口径与线程安全说明见 :class:`_PendingGauge`
+文档)。
+
 测试约定:``run_scan`` / ``memory`` / ``executor`` / ``sleep`` / ``jitter``
 均可注入,通知经模块级 ``_default_notify``(monkeypatch 替换);全部离线、
 零真实 sleep、零网络。
@@ -91,6 +99,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import random as _random
+import threading
 import time
 from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, Callable, NamedTuple
@@ -433,6 +442,61 @@ class _TimedScanAdapter:
                 logger.warning("AIMD on_task_done 记录失败(不影响扫描):%s", exc)
 
 
+class _PendingGauge:
+    """提交侧未完成计数器(G4,O(1) 化):提交 +1、future 完成回调 −1、
+    读数一次 O(1)——取代旧实现逐个扫 ``futures`` 判 ``fut.done()`` 的
+    O(n) 计数(V10.12 静态路径"数到阈值+1 早退"仍为 O(backlog),aimd
+    路径为 O(已提交数)全量扫描)。
+
+    线程安全口径(重要,与 :class:`ops.aimd.AIMDController` 的锁纪律同款):
+
+    - 递减回调经 ``add_done_callback`` 在**完成 future 的线程**里执行
+      (线程池 = worker 线程;同步 fake 执行器 = 提交线程),与提交侧的
+      +1 / 读数跨线程并发。CPython GIL 下裸 ``int += 1`` 是"读-改-写"
+      多条字节码,其间可换线程,**并非原子**——丢一次更新计数就只增
+      不减(背压永久误触发),因此用一把轻量 ``Lock`` 保护全部三类
+      操作;锁内零 IO 零睡眠,仍是严格 O(1);
+    - ``Future`` 完成时先置位状态、后执行 done 回调,本计数读到的是
+      "已完成回调"口径;与旧实现读 ``fut.done()`` 相比,在"已置位、
+      回调尚未跑到"的微秒级窗口内读数可能瞬时偏高——该窗口远小于
+      提交间隔(每提交至少 ``PAUSE_BASE_S``+ 秒),且并发完成下两种
+      口径本就是竞态快照,背压布尔判定(``pending`` 超阈 / 达窗)的
+      语义与既有停顿序列断言不变;
+    - 作用域 = 一个分片的 ``futures`` 列表(与旧计数完全同口径):
+      :func:`_run_shard` 每次调用新建计数器;分片聚合把全部 future
+      排空后才返回,新分片从 0 起步,上一分片残留的晚到回调只会递减
+      一个不再被读的旧计数器,绝不泄漏到新分片的背压判定。
+    """
+
+    __slots__ = ("_value", "_lock")
+
+    def __init__(self) -> None:
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def track(self, fut: Future[Any]) -> None:
+        """登记一笔新提交:先 +1,再挂完成回调 −1。
+
+        先 +1 后挂回调的顺序保证:即便 future 在挂回调前已完成(同步
+        执行器形态),``add_done_callback`` 对已完成 future 会在调用
+        线程**立即执行**回调,−1 必然落在 +1 之后,计数永不出现负数。
+        """
+        with self._lock:
+            self._value += 1
+        fut.add_done_callback(self._on_done)
+
+    def _on_done(self, _fut: Future[Any]) -> None:
+        """完成回调(成功/失败/取消一律计):−1,绝不抛错、绝不外呼。"""
+        with self._lock:
+            self._value -= 1
+
+    @property
+    def value(self) -> int:
+        """当前未完成提交数(锁内一次整数读,O(1))。"""
+        with self._lock:
+            return self._value
+
+
 # ---------------------------------------------------------------------------
 # 池主体:提交(串行 + 礼貌间隔)→ 聚合(失败隔离);A236 分片/重建编排
 # ---------------------------------------------------------------------------
@@ -451,6 +515,7 @@ def _run_shard(
     timed_mode: bool,
     summary: dict[str, Any],
     should_end_shard: Callable[[], bool] | None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> int:
     """在给定 executor 上提交并聚合**一个分片**,返回实际处理的目标数。
 
@@ -467,10 +532,29 @@ def _run_shard(
       :func:`_scan_one_timed`,聚合时拆 :class:`_TimedOutcome` 回壳、把
       worker 时长喂 ``aimd.on_task_done``(失败任务照实回传);线程形态
       仍提交 :func:`_scan_one` / :func:`_scan_one_traced` 原样。
+
+    V10.35(P2-7)优雅退出:``stop_check``(默认 None=不启用)在**每个
+    提交间隙**检查,置位即置 ``summary["interrupted"]=True`` 并停止提交
+    新目标(**已提交任务在随后的聚合中全部排空**,绝不半途弃单);未提交
+    尾部的登记职责归调用方(分片只如实返回处理数,避免内外两层重复记账)。
+    分片可整片零提交(stop 优先于 A236 的"每分片至少 1 个"进度保证——
+    整批都在收尾,推进性不再有意义)。
+
+    G4(2026-10-13):未完成数经 :class:`_PendingGauge` 一次 O(1) 读出
+    (提交 +1 / done 回调 −1),静态背压与 AIMD 两路径共用同一读数,
+    取代旧的逐 future ``done()`` 计数;阈值比较布尔语义与停顿序列不变。
     """
     futures: list[tuple[str, Future[Any]]] = []
+    pending_gauge = _PendingGauge()  # G4:本分片未完成计数器(O(1) 背压读数)
     processed = 0
     for url in shard:
+        # V10.35 优雅退出:提交间隙检查停机请求(先于一切提交动作)
+        if stop_check is not None and stop_check():
+            summary["interrupted"] = True
+            logger.info(
+                "收到优雅退出请求:本分片停止提交(已在飞任务继续排空)"
+            )
+            break
         # A236 重建闭环:提交间检查窗口收缩(首目标不检查,见函数文档)
         if futures and should_end_shard is not None and should_end_shard():
             logger.debug(
@@ -490,8 +574,13 @@ def _run_shard(
         # 背压:默认(aimd=None)沿用静态阈值——已提交未完成的任务数超过
         # workers×BACKLOG_FACTOR → 多停一轮;注入 aimd(A212)时同一停顿
         # 动作改由 aimd.should_pause(pending) 驱动(动态并发窗口,红线 35:
-        # 停顿时长恒为固定礼貌常量,AIMD 只增不减对外礼貌)
-        pending = sum(1 for _, fut in futures if not fut.done())
+        # 停顿时长恒为固定礼貌常量,AIMD 只增不减对外礼貌)。
+        # G4(V10.15):未完成数改由 _PendingGauge 一次 O(1) 读出(V10.12
+        # 静态路径"数到阈值+1 早退"仍为 O(backlog),aimd 路径为 O(已提交
+        # 数)全量扫描);计数口径 = 已提交 − 已完成回调,静态阈值比较的
+        # 布尔语义与 aimd 全量口径在受控场景下逐点同值(既有停顿序列
+        # 断言零变化,计数器竞态窗口说明见 _PendingGauge 文档)。
+        pending = pending_gauge.value
         if aimd is not None:
             overload = aimd.should_pause(pending)
         else:
@@ -523,7 +612,9 @@ def _run_shard(
         elif snap is not None and snap.trace_id is not None:
             task = _scan_one_traced
             task_args = (url, cfg, scan, memory, snap)
-        futures.append((url, executor.submit(task, *task_args)))
+        fut = executor.submit(task, *task_args)
+        pending_gauge.track(fut)  # G4:O(1) 未完成计数(+1 并挂完成回调 −1)
+        futures.append((url, fut))
         pause(PAUSE_BASE_S + PAUSE_JITTER_S * jitter_fn())
 
     def _fail(url: str, message: str) -> None:
@@ -586,6 +677,7 @@ def _run_rebuilding(
     propagate_trace: bool,
     aimd: AIMDController,
     summary: dict[str, Any],
+    stop_check: Callable[[], bool] | None = None,
 ) -> None:
     """A236 窗口→executor 重建闭环(就地填充 ``summary``,不返回)。
 
@@ -618,6 +710,16 @@ def _run_rebuilding(
     idx = 0
     try:
         while idx < len(targets):
+            # V10.35 优雅退出:分片间检查(分片内由 _run_shard 的提交间隙检查接力)
+            if stop_check is not None and stop_check():
+                summary["interrupted"] = True
+                summary.setdefault("not_submitted", []).extend(targets[idx:])
+                telemetry.inc("pool.graceful.not_submitted", len(targets) - idx)
+                logger.info(
+                    "收到优雅退出请求:重建闭环停止提交(剩余 %d 个不再提交)",
+                    len(targets) - idx,
+                )
+                break
             shard_size = max(1, aimd.permits)  # 分片大小 N = 当前 permits 的函数
             logger.debug(
                 "A236 重建闭环分片:剩余 %d,窗口 %d → 本分片至多 %d 个",
@@ -628,11 +730,20 @@ def _run_rebuilding(
                 executor=current, scan=scan, memory=memory,
                 pause=pause, jitter_fn=jitter_fn, backlog_limit=backlog_limit,
                 propagate_trace=propagate_trace, aimd=aimd, timed_mode=False,
-                summary=summary,
+                summary=summary, stop_check=stop_check,
                 # 提交间检查:窗口相比建池时收缩越过 1/REBUILD_FACTOR → 提前收尾
                 should_end_shard=lambda: aimd.permits * REBUILD_FACTOR <= build_permits,
             )
             idx += processed
+            if summary.get("interrupted"):
+                # 分片内已优雅收尾:未提交尾部(分片尾 + 后续分片)一并登记后整批收场
+                summary.setdefault("not_submitted", []).extend(targets[idx:])
+                telemetry.inc("pool.graceful.not_submitted", len(targets) - idx)
+                logger.info(
+                    "优雅退出:重建闭环收场(未提交 %d 个,已在飞任务继续排空)",
+                    len(targets) - idx,
+                )
+                break
             if idx >= len(targets):
                 break  # 已无剩余目标:重建只剩成本,不做
             permits = aimd.permits
@@ -688,6 +799,7 @@ def _run_batch(
     rebuild_executor: bool = False,
     executor_factory: Callable[[int], Executor] | None = None,
     executor_workers: int | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """在给定 executor 上跑完整批目标,返回汇总字典(纯聚合,不建线程池)。
 
@@ -703,6 +815,13 @@ def _run_batch(
     (:func:`_run_rebuilding`);``executor_factory`` / ``executor_workers``
     由 :func:`run_pool` 的自建线程池分支透传,直接调用方(测试)亦可
     自行注入记录式工厂。
+
+    V10.35(P2-7)优雅退出:``stop_check``(默认 None=逐字节旧行为)置位
+    → 停止提交新目标,未提交清单登记进 ``summary["not_submitted"]``、
+    置 ``summary["interrupted"]=True``(两键仅中断时出现);已提交任务
+    **全部排空**(聚合循环逐 future 取结果,等待上界 = 单站在飞时长)。
+    记账恒等式扩为
+    ``done + failed + skipped + len(not_submitted) == total``。
     """
     summary: dict[str, Any] = {
         "total": len(targets),
@@ -747,20 +866,36 @@ def _run_batch(
             ),
             scan=scan, memory=memory, pause=pause, jitter_fn=jitter_fn,
             backlog_limit=backlog_limit, propagate_trace=propagate_trace,
-            aimd=aimd, summary=summary,
+            aimd=aimd, summary=summary, stop_check=stop_check,
         )
     else:
-        _run_shard(
+        processed = _run_shard(
             cfg, targets, executor=executor, scan=scan, memory=memory,
             pause=pause, jitter_fn=jitter_fn, backlog_limit=backlog_limit,
             propagate_trace=propagate_trace, aimd=aimd, timed_mode=timed_mode,
-            summary=summary, should_end_shard=None,
+            summary=summary, should_end_shard=None, stop_check=stop_check,
         )
+        if summary.get("interrupted"):
+            # 未提交尾部登记(分片只返回处理数,登记职责在此;恒等式守恒)
+            summary.setdefault("not_submitted", []).extend(targets[processed:])
+            telemetry.inc("pool.graceful.not_submitted", len(targets) - processed)
+            logger.info(
+                "优雅退出:批量池收场(未提交 %d 个,已在飞任务已全部排空)",
+                len(targets) - processed,
+            )
 
-    logger.info(
-        "并发扫描池结束:总计 %d,完成 %d,指纹未变跳过 %d,失败 %d",
-        summary["total"], summary["done"], summary["skipped"], summary["failed"],
-    )
+    if summary.get("interrupted"):
+        logger.info(
+            "并发扫描池结束(优雅退出):总计 %d,完成 %d,指纹未变跳过 %d,"
+            "失败 %d,未提交 %d",
+            summary["total"], summary["done"], summary["skipped"],
+            summary["failed"], len(summary.get("not_submitted") or []),
+        )
+    else:
+        logger.info(
+            "并发扫描池结束:总计 %d,完成 %d,指纹未变跳过 %d,失败 %d",
+            summary["total"], summary["done"], summary["skipped"], summary["failed"],
+        )
     return summary
 
 
@@ -777,6 +912,7 @@ def run_pool(
     propagate_trace: bool = True,
     aimd: AIMDController | None = None,
     rebuild_executor: bool = False,
+    stop_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """并发扫描一批目标 URL,返回本轮汇总。
 
@@ -808,7 +944,11 @@ def run_pool(
     6. **失败隔离**:单个 URL 扫描抛异常只计入 ``failed`` / ``errors``,
        不设 Future 超时、不中断其余目标;
     7. ``needs_review`` 的报告经 ``_default_notify`` 单发 ``pending_review``
-       提醒(惰性导入 notify.hub,失败仅告警;skipped 一律不 notify)。
+       提醒(惰性导入 notify.hub,失败仅告警;skipped 一律不 notify);
+    8. **优雅退出(V10.35,P2-7)**:``stop_check`` 注入时,提交循环在每个
+       提交间隙检查——置位即停止提交新目标、**排空全部在飞任务**后收场
+       (摘要新增 ``interrupted`` / ``not_submitted`` 两键,仅中断时出现);
+       对外礼貌间隔与已提交任务的完成语义零触碰(红线 35)。
 
     :param cfg: 全局配置(memory 缺省路径取 ``cfg.data_dir``)。
     :param items: 目标 URL 列表(只扫其中去重后的条目,不扩大范围)。
@@ -842,19 +982,27 @@ def run_pool(
         父进程聚合时回喂(外层 summary 形状两种形态完全一致)。窗口上限
         由构造方的档位 workers 决定(≤ 物理核数,红线 37);对外礼貌间隔
         不受任何影响(红线 35,见模块文档)。
-    :param rebuild_executor: A236 窗口→executor 重建闭环开关(默认 False=
-        现状单池跑完,行为逐字节不变):True 时**仅对 run_pool 自建的
-        线程池**生效——按当前 AIMD 窗口分片提交,窗口相比建池时刻减半
-        (或回升翻倍)则排空当前分片后以 ``min(permits, workers)`` 重建
-        线程池,恒不超过原始档位 workers(红线 47/37);重建期间礼貌/
-        背压停顿零触碰(红线 35),成本记 ``pool.rebuild.count`` /
-        ``pool.rebuild.duration``(失败计 ``pool.rebuild.failure`` 并回退
-        原池,不中断)。需同时注入 ``aimd``(无窗口信号则单分片跑完,
-        行为与现状一致);**注入 executor 时本开关被忽略并告警**(注入
-        池归调用方所有,本函数绝不重建/关闭)。
-    :return: ``{"total", "done", "failed", "skipped",
-        "results": {url: verdict.value}, "errors": [(url, 错误信息), ...]}``,
-        且恒有 ``done + failed + skipped == total``。
+        :param rebuild_executor: A236 窗口→executor 重建闭环开关(默认 False=
+            现状单池跑完,行为逐字节不变):True 时**仅对 run_pool 自建的
+            线程池**生效——按当前 AIMD 窗口分片提交,窗口相比建池时刻减半
+            (或回升翻倍)则排空当前分片后以 ``min(permits, workers)`` 重建
+            线程池,恒不超过原始档位 workers(红线 47/37);重建期间礼貌/
+            背压停顿零触碰(红线 35),成本记 ``pool.rebuild.count`` /
+            ``pool.rebuild.duration``(失败计 ``pool.rebuild.failure`` 并回退
+            原池,不中断)。需同时注入 ``aimd``(无窗口信号则单分片跑完,
+            行为与现状一致);**注入 executor 时本开关被忽略并告警**(注入
+            池归调用方所有,本函数绝不重建/关闭)。
+        :param stop_check: V10.35(P2-7)优雅退出谓词(默认 None=逐字节
+            旧行为):每个提交间隙调用,返回 True 即停止提交新目标、
+            排空在飞任务后收场;摘要新增 ``interrupted: True`` 与
+            ``not_submitted: [未提交 URL]`` 两键(仅中断时出现)。通常由
+            :class:`netsentinel.ops.graceful.GracefulExit.should_stop`
+            注入(信号处理器置位);**绝不影响**对外礼貌间隔与已提交任务
+            的完成语义(红线 35)。
+        :return: ``{"total", "done", "failed", "skipped",
+            "results": {url: verdict.value}, "errors": [(url, 错误信息), ...]}``,
+            且恒有 ``done + failed + skipped == total``(优雅中断时扩为
+            ``done + failed + skipped + len(not_submitted) == total``)。
 
     可观测性(V5):整批耗时记 ``telemetry.timer("pool.total")``,按结局累加
     ``pool.done`` / ``pool.failed`` / ``pool.skipped`` 三个计数器,触发背压
@@ -892,31 +1040,56 @@ def run_pool(
                 "使用注入的 executor(%s);workers=%d 仅作背压阈值,不强制收窄",
                 type(executor).__name__, workers,
             )
-            return _run_batch(
+            summary = _run_batch(
                 cfg, targets, executor=executor, scan=scan, memory=memory,
                 pause=pause, jitter_fn=jitter_fn, workers=workers,
                 propagate_trace=propagate_trace, aimd=aimd,
+                stop_check=stop_check,
             )
+        else:
+            n_workers = max(1, int(workers))
+            if not rebuild_executor:
+                with ThreadPoolExecutor(max_workers=n_workers) as own:
+                    summary = _run_batch(
+                        cfg, targets, executor=own, scan=scan, memory=memory,
+                        pause=pause, jitter_fn=jitter_fn, workers=n_workers,
+                        propagate_trace=propagate_trace, aimd=aimd,
+                        stop_check=stop_check,
+                    )
+            else:
+                # A236 重建闭环:自建初始池(归本函数,finally 必关);批内重建由
+                # _run_batch/_run_rebuilding 经 executor_factory 就地完成(工厂建出
+                # 的池同样必关,不养孤儿线程)
+                own = ThreadPoolExecutor(max_workers=n_workers)
+                try:
+                    summary = _run_batch(
+                        cfg, targets, executor=own, scan=scan, memory=memory,
+                        pause=pause, jitter_fn=jitter_fn, workers=n_workers,
+                        propagate_trace=propagate_trace, aimd=aimd,
+                        rebuild_executor=True, executor_workers=n_workers,
+                        executor_factory=_default_executor_factory,
+                        stop_check=stop_check,
+                    )
+                finally:
+                    own.shutdown(wait=True)
+        _export_telemetry(cfg)  # V10.35(P2-7b):批末遥测快照落盘(未配置=空操作)
+        return summary
 
-        n_workers = max(1, int(workers))
-        if not rebuild_executor:
-            with ThreadPoolExecutor(max_workers=n_workers) as own:
-                return _run_batch(
-                    cfg, targets, executor=own, scan=scan, memory=memory,
-                    pause=pause, jitter_fn=jitter_fn, workers=n_workers,
-                    propagate_trace=propagate_trace, aimd=aimd,
-                )
-        # A236 重建闭环:自建初始池(归本函数,finally 必关);批内重建由
-        # _run_batch/_run_rebuilding 经 executor_factory 就地完成(工厂建出
-        # 的池同样必关,不养孤儿线程)
-        own = ThreadPoolExecutor(max_workers=n_workers)
-        try:
-            return _run_batch(
-                cfg, targets, executor=own, scan=scan, memory=memory,
-                pause=pause, jitter_fn=jitter_fn, workers=n_workers,
-                propagate_trace=propagate_trace, aimd=aimd,
-                rebuild_executor=True, executor_workers=n_workers,
-                executor_factory=_default_executor_factory,
-            )
-        finally:
-            own.shutdown(wait=True)
+
+def _export_telemetry(cfg: Config) -> None:
+    """V10.35(P2-7b):批末遥测快照追加落盘;``cfg.telemetry_jsonl_path`` 空 = 空操作。
+
+    - 快照只含名称与数字(计数器/仪表/计时统计,红线 17),不含站点内容;
+    - 落盘失败只中文告警 + 计数 ``telemetry.export.failed``,绝不中断批次
+      (观测性让位于主流程);
+    - 追加式(append):每批一行,长跑自然形成时序台账。
+    """
+    path = (getattr(cfg, "telemetry_jsonl_path", "") or "").strip()
+    if not path:
+        return
+    try:
+        telemetry.export_jsonl(path)
+        telemetry.inc("telemetry.export")
+    except Exception as exc:  # noqa: BLE001 - 观测失败不拖垮主流程
+        telemetry.inc("telemetry.export.failed")
+        logger.warning("遥测快照落盘失败(不中断批次):%s", exc)

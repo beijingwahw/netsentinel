@@ -45,7 +45,10 @@ A205 产包签名策略接线(默认关闭,显式配置才签名):
     from netsentinel.evidence.packager import build_bundle
     bundle = build_bundle(report, cfg)      # → EvidenceBundle(zip_path=...)
 
-仅使用标准库:json / zipfile / hashlib / shutil / stat / pathlib / urllib.parse / re / os。
+仅使用标准库:json / zipfile / hashlib / shutil / stat / pathlib / urllib.parse / re / os,
+以及基座级时间源 :mod:`netsentinel.timesource`(V10.21 席位2 时间源单源化,
+目录名/摘要时间戳改经 ``timesource.now_local().strftime``,strftime 墙钟
+输出与原 naive ``datetime.now()`` 逐字节等价)。
 """
 from __future__ import annotations
 
@@ -58,11 +61,11 @@ import shutil
 import stat as _stat
 import urllib.parse
 import zipfile
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from netsentinel import telemetry
+from netsentinel import timesource
 from netsentinel.contracts import (
     Config,
     EvidenceBundle,
@@ -117,7 +120,13 @@ _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9.-]")
 
 
 def _safe_host(site_url: str) -> str:
-    """提取站点主机名并替换文件系统非法字符;取不到主机名时返回 ``unknown``。"""
+    """提取站点主机名并替换文件系统非法字符;取不到主机名时返回 ``unknown``。
+
+    镜像实现锁:同款 host 清洗在 evidence/parallel_pack.py(锁键须与目录
+    前缀逐字符一致,测试 test_parallel_pack 已锁定)与
+    crawler/browser.py(截图命名,取 netloc 含端口,口径不同)各有一份;
+    修改字符集/兜底值须三处同步评估。
+    """
     host = urllib.parse.urlparse(site_url).hostname or ""
     cleaned = _UNSAFE_CHARS.sub("_", host).rstrip(".")
     return cleaned or "unknown"
@@ -421,7 +430,7 @@ def build_bundle(report: SiteReport, cfg: Config) -> EvidenceBundle:
     with telemetry.timer("packager.bundle"):
         safe_host = _safe_host(report.site_url)
         evidence_root = Path(cfg.evidence_dir)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = timesource.now_local().strftime("%Y%m%d_%H%M%S")
 
         bundle_dir = evidence_root / f"{safe_host}_{ts}"
         seq = 1
@@ -449,7 +458,7 @@ def build_bundle(report: SiteReport, cfg: Config) -> EvidenceBundle:
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        generated_at = timesource.now_local().strftime("%Y-%m-%d %H:%M:%S")
         summary_path = bundle_dir / SUMMARY_NAME
         summary_path.write_text(
             _render_summary(report, entries, generated_at), encoding="utf-8"

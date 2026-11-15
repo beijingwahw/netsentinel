@@ -41,15 +41,23 @@ CLI 对应 ``list --sort triage``。
 事件账本双写(A213 · 事件溯源,默认关闭):``__init__`` 新增仅关键字参数
 ``event_log``(默认 ``None`` = 现状,**不启用时零事件、零额外 SQL,行为
 逐字节不变**)。显式传入 :class:`~netsentinel.storage.event_log.EventLog`
-后,``add / approve / reject / mark_submitted / annotate`` 在每次状态变更
-**提交前**先把事件 append 进账本(事件类型 ``entry_added`` /
-``entry_approved`` / ``entry_rejected`` / ``entry_marked_submitted`` /
-``entry_annotated``,可选 ``actor=`` 署名)——**先账本后状态**(崩溃一致性
-红线):两步之间进程崩溃时,账本会多一条"已记未生效"事件,而绝不会出现
-"状态已变、账本无据";前者由 :func:`netsentinel.storage.replay.replay_review_queue`
-对账并如实报告为"事件超前",重放语义按"事件存在但状态可能滞后"处理。
-四眼 / 状态机校验逻辑零改动:非法迁移在校验阶段即抛 ValueError,不会产生
-任何事件;账本 append 失败时本次状态写入整体回滚(账本与状态都不动)。
+后,``add / approve / reject / mark_submitted / annotate`` 的双写按如下
+事务边界执行(**先账本提交、后状态提交**):
+
+1. 状态变更 SQL 先在队列连接的**未提交事务**里执行(如 ``add`` 的
+   INSERT,并取 ``lastrowid`` 作为事件关联的 entry_id);
+2. 事件 append 进账本并**立即在账本自己的连接上提交**(事件类型
+   ``entry_added`` / ``entry_approved`` / ``entry_rejected`` /
+   ``entry_marked_submitted`` / ``entry_annotated``,可选 ``actor=`` 署名);
+3. 最后才提交队列连接上的状态事务。
+
+崩溃一致性红线(先账本后状态):第 2 步与第 3 步之间进程崩溃时,账本
+已有一条"已记未生效"事件、队列事务随连接断开而回滚——只会出现"账本
+有据、状态未生效"(由 :func:`netsentinel.storage.replay.replay_review_queue`
+对账并如实报告为"事件超前",重放语义按"事件存在但状态可能滞后"处理),
+绝不会出现"状态已变、账本无据"。四眼 / 状态机校验逻辑零改动:非法迁移
+在校验阶段即抛 ValueError,不会产生任何事件;账本 append 失败时本次
+状态写入整体回滚(账本与状态都不动)。
 """
 from __future__ import annotations
 
@@ -78,6 +86,11 @@ from netsentinel.storage.event_log import (
     EVENT_ENTRY_REJECTED,
     EventLog,
 )
+#: SQLite 忙等上限(毫秒):跨进程并发写时的锁等待窗口;V10.24 起自
+#: :mod:`netsentinel.storage.kernel` 单源再导出(storage/event_log 同款,
+#: 名字 / __all__ / 取值 5000 均不变)。
+from netsentinel.storage.kernel import BUSY_TIMEOUT_MS
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +115,6 @@ VERDICT_CN: dict[str, str] = {
 #: 默认库路径,与 contracts.Config.db_path 保持一致。
 DEFAULT_DB_PATH = "data/review_queue.db"
 
-#: SQLite 忙等上限(毫秒):跨进程并发写时的锁等待窗口(V5 统一)。
-BUSY_TIMEOUT_MS: int = 5000
-
 #: CLI list 表格单列默认最大显示宽度(CJK 按双宽计):超宽 URL/路径截断,
 #: 终端友好;``--wide`` 可完整显示。仅影响显示,不影响库中数据。
 MAX_CELL_DISPLAY_WIDTH: int = 48
@@ -119,6 +129,7 @@ __all__ = [
     "Entry",
     "ReviewQueue",
     "main",
+    "reconcile_human_machine",
 ]
 
 _SCHEMA_SQL = """
@@ -131,7 +142,8 @@ CREATE TABLE IF NOT EXISTS entries (
     created_at   TEXT    NOT NULL DEFAULT '',
     updated_at   TEXT    NOT NULL DEFAULT '',
     note         TEXT    NOT NULL DEFAULT '',
-    priority_weight REAL NOT NULL DEFAULT 0.0
+    priority_weight REAL NOT NULL DEFAULT 0.0,
+    machine_agg  REAL    NOT NULL DEFAULT -1.0
 )
 """
 
@@ -144,6 +156,11 @@ _INDEX_SQL = (
 #: 旧库补建 priority_weight 列的 DDL(仅当 PRAGMA table_info 探测到缺失时执行)。
 _PRIORITY_WEIGHT_COLUMN_SQL = (
     "ALTER TABLE entries ADD COLUMN priority_weight REAL NOT NULL DEFAULT 0.0"
+)
+
+#: P2 第 5 步「复核结论 vs 机器分」对账列旧库补建(-1.0 = 未记录/旧数据)。
+_MACHINE_AGG_COLUMN_SQL = (
+    "ALTER TABLE entries ADD COLUMN machine_agg REAL NOT NULL DEFAULT -1.0"
 )
 
 
@@ -165,6 +182,7 @@ class Entry:
     updated_at: str = ""
     note: str = ""
     priority_weight: float = 0.0
+    machine_agg: float = -1.0
 
 
 class ReviewQueue:
@@ -186,12 +204,10 @@ class ReviewQueue:
         #: 事件账本(None = 不启用双写,行为与旧版逐字节一致)。
         self._event_log = event_log
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = sqlite_connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        # V5:一律 WAL + 忙等 5s(读写并发 / 跨进程锁等待),
-        # 与 vlm_cache 等存储模块同一连接策略。
-        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # V10.21:连接统一经 storage.kernel.connect 工厂(全仓唯一
+        # sqlite3.connect 入口);WAL + 忙等 5s 由工厂内置,口径不变。
         self._conn.execute(_SCHEMA_SQL)
         # V5:status 索引旧库补建(IF NOT EXISTS,老数据打开即享受索引)。
         self._conn.execute(_INDEX_SQL)
@@ -201,6 +217,9 @@ class ReviewQueue:
         }
         if "priority_weight" not in columns:
             self._conn.execute(_PRIORITY_WEIGHT_COLUMN_SQL)
+        # P2 第 5 步:machine_agg 对账列旧库补建(缺列才 ALTER,老数据补 -1)。
+        if "machine_agg" not in columns:
+            self._conn.execute(_MACHINE_AGG_COLUMN_SQL)
         self._conn.commit()
         logger.debug("复核队列已就绪:%s", self.db_path)
 
@@ -264,12 +283,16 @@ class ReviewQueue:
         if verdict is None:  # 容忍鸭子类型:直接给了字符串
             verdict = str(report.verdict)
         weight = self._validate_priority_weight(priority_weight)
+        # P2 第 5 步:「复核结论 vs 机器分」对账字段——入列时定格机器聚合分
+        # (-1.0 = 报告缺失该字段/旧调用方),供 reconcile_human_machine 出账。
+        machine_agg = float(getattr(report, "agg_nsw_prob", -1.0))
         ts = now_iso()
         cur = self._conn.execute(
             "INSERT INTO entries (site_url, verdict, status, evidence_zip,"
-            " created_at, updated_at, note, priority_weight)"
-            " VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
-            (report.site_url, verdict, evidence_zip, ts, ts, str(note or ""), weight),
+            " created_at, updated_at, note, priority_weight, machine_agg)"
+            " VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+            (report.site_url, verdict, evidence_zip, ts, ts, str(note or ""),
+             weight, machine_agg),
         )
         entry_id = int(cur.lastrowid or 0)
         if self._event_log is None:
@@ -557,6 +580,7 @@ class ReviewQueue:
             updated_at=row["updated_at"] or "",
             note=row["note"] or "",
             priority_weight=float(row["priority_weight"] or 0.0),
+            machine_agg=float(row["machine_agg"] if "machine_agg" in row.keys() else -1.0),
         )
 
     def close(self) -> None:
@@ -594,6 +618,77 @@ def _verdict_label(verdict: str) -> str:
     if not verdict:
         return "-"
     return f"{VERDICT_CN.get(verdict, '未知')}({verdict})"
+
+
+def reconcile_human_machine(db_path: str = DEFAULT_DB_PATH) -> dict:
+    """「复核结论 vs 机器分」对账报告(P2 第 5 步,只读)。
+
+    以人工复核结论为真值锚点:``approved/submitted`` = 人确认违规、
+    ``rejected`` = 人判机器报错。产出四类口径(只统计已出结论条目):
+
+    - **机器高判被确认**:人确认且机器 verdict=nsfw(机器判断被人背书);
+    - **机器保守被人补判**:人确认但机器 verdict=suspect(三档判定的
+      安全设计,非机器错误);
+    - **误报候选(FP proxy)**:人拒绝且机器 verdict=nsfw 或
+      machine_agg ≥ 0.9(机器最高档被人类否决——最值得复盘的样本);
+    - **识别失信条目**:note 含「识别失败」(V10.24 诚信升级入列,
+      机器分不可信,单独计数不进 FP/FN)。
+
+    诚实边界(如实在报告里输出):机器判 clean 的站点**不入列**,故
+    本报告**测不了漏报(FN)**——FN 只能靠图片级标注集
+    (``netsentinel.vision.calibration``)测量;机器分缺失
+    (machine_agg=-1,旧数据)条目按「未记录」单列。
+    """
+    conn = sqlite_connect(db_path, readonly=True)
+    try:
+        rows = [
+            (int(r[0]), str(r[1] or ""), str(r[2] or ""), str(r[3] or ""),
+             float(r[4] if r[4] is not None else -1.0), str(r[5] or ""))
+            for r in conn.execute(
+                "SELECT id, site_url, verdict, status, machine_agg, note"
+                " FROM entries WHERE status IN ('approved','submitted','rejected')"
+                " ORDER BY id ASC"
+            )
+        ]
+    finally:
+        conn.close()
+
+    confirmed = rejected = fp_candidates = 0
+    machine_nsw_confirmed = suspect_confirmed = trust_lost = no_score = 0
+    fp_rows: list[dict] = []
+    for eid, site, verdict, status, agg, note in rows:
+        if "识别失败" in note:
+            trust_lost += 1
+            continue
+        if agg < 0.0:
+            no_score += 1
+        if status in ("approved", "submitted"):
+            confirmed += 1
+            if verdict == "nsfw":
+                machine_nsw_confirmed += 1
+            else:
+                suspect_confirmed += 1
+        else:  # rejected
+            rejected += 1
+            if verdict == "nsfw" or agg >= 0.9:
+                fp_candidates += 1
+                fp_rows.append({
+                    "id": eid, "site": site, "verdict": verdict,
+                    "machine_agg": agg, "note": note,
+                })
+    return {
+        "total_concluded": confirmed + rejected + trust_lost,
+        "human_confirmed": confirmed,
+        "human_rejected": rejected,
+        "machine_nsw_confirmed_by_human": machine_nsw_confirmed,
+        "machine_suspect_confirmed_by_human": suspect_confirmed,
+        "fp_candidates": fp_candidates,
+        "fp_candidate_rows": fp_rows,
+        "trust_lost_entries": trust_lost,
+        "no_machine_score_entries": no_score,
+        "fn_note": "机器判 clean 不入列,本报告测不了漏报(FN)——FN 由图片级"
+                   "标注集(netsentinel.vision.calibration)测量",
+    }
 
 
 def _truncate(text: str, width: int | None = MAX_CELL_DISPLAY_WIDTH) -> str:
@@ -641,7 +736,8 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[db_top],
     )
     sub = parser.add_subparsers(
-        dest="command", required=True, metavar="{list,show,approve,reject}"
+        dest="command", required=True,
+        metavar="{list,show,approve,reject,reconcile}",
     )
 
     p_list = sub.add_parser("list", help="列出复核条目", parents=[db_sub])
@@ -678,7 +774,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_reject.add_argument("id", type=int, help="条目编号")
     p_reject.add_argument("--note", default="", help="驳回原因(可选)")
+    p_reconcile = sub.add_parser(
+        "reconcile", help="「复核结论 vs 机器分」对账报告(只读)",
+        parents=[db_sub],
+    )
     return parser
+
+
+def _cmd_reconcile(db_path: str) -> int:
+    """打印对账报告(只读;FN 边界见 reconcile_human_machine 文档)。"""
+    result = reconcile_human_machine(db_path)
+    print("复核结论 vs 机器分 对账报告(只读)")
+    print(f"  已出结论条目:{result['total_concluded']}"
+          f"(人确认 {result['human_confirmed']} / 人拒绝 {result['human_rejected']}"
+          f" / 识别失信 {result['trust_lost_entries']})")
+    print(f"  机器 nsfw 档被人确认:{result['machine_nsw_confirmed_by_human']}")
+    print(f"  机器 suspect 档被人补判确认:{result['machine_suspect_confirmed_by_human']}")
+    print(f"  误报候选(FP proxy,最值得复盘):{result['fp_candidates']}")
+    for row in result["fp_candidate_rows"]:
+        print(f"    - #{row['id']} {row['site']} verdict={row['verdict']}"
+              f" agg={row['machine_agg']:.4f}")
+    print(f"  机器分未记录(旧数据):{result['no_machine_score_entries']}")
+    print(f"  边界:{result['fn_note']}")
+    return 0
 
 
 def _cmd_list(
@@ -769,6 +887,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_approve(queue, args.id, args.note)
         if args.command == "reject":
             return _cmd_reject(queue, args.id, args.note)
+        if args.command == "reconcile":
+            return _cmd_reconcile(args.db)
         raise ValueError(f"未知子命令:{args.command}")  # pragma: no cover - argparse 已拦截
     except ValueError as exc:
         print(f"错误:{exc}", file=sys.stderr)

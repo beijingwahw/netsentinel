@@ -27,6 +27,15 @@
 
 红线 12:哈希库数据仅存本地,绝不外发;近重复比对只对运营者自己采集的
 证据进行。本模块无任何网络行为。
+
+**G3 分带预过滤(创世纪升级波)**:``find_similar`` 的 64bit 汉明路径
+(``hash_kind`` ∈ {"phash", "mirror"} 且查询为 16 hex 定长)把指纹按
+**4 带 × 16bit** 预拆——鸽笼原理:汉明距离 d' 的每个翻转位只落在唯一
+一个带内,故"非零带数 ≤ d'";非零带数 > max_distance 的行汉明距离必
+> max_distance,直接跳过精确计算。预过滤只减少进入精确比较的行数,
+返回 / 排序 / 并列 / 截断 / 脏行遥测语义逐位不变(论证与有效域详见
+:meth:`PhashRegistry.find_similar`);:attr:`PhashRegistry.find_exact_compares`
+累计精确距离计算次数(红线 31 的操作计数口径,剪枝效果度量)。
 """
 from __future__ import annotations
 
@@ -37,10 +46,11 @@ import sqlite3
 import statistics
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from netsentinel import telemetry
 from netsentinel.contracts import now_iso
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 __all__ = [
     "DEFAULT_DB_PATH",
@@ -62,9 +72,6 @@ DEFAULT_DB_PATH = "data/phash.db"
 #: ``find_similar`` 返回条数上限(全表扫保持;超限时截断并记 warning,
 #: 提示调用方收窄 max_distance 或清理哈希库——V5)。
 MAX_FIND_RESULTS = 200
-
-#: sqlite 连接统一设置:写前等待锁的最长毫秒数(V5,与全仓 sqlite 口径一致)。
-_BUSY_TIMEOUT_MS = 5000
 
 _DCT_SIZE = 32   # DCT 前统一缩放尺寸
 _LOW_FREQ = 8    # 只取左上 8x8 低频系数
@@ -288,7 +295,8 @@ def _pyramid_distance_hex(a: str, b: str) -> int:
 
     与 ``netsentinel.vision.phash2.pyramid_distance`` 口径**完全一致**的
     本地实现——不直接 import 是因为主干分层契约(vision 层在 intel 层
-    之上,intel 不得上溯依赖),两处实现由
+    之上,intel 不得上溯依赖)。双实现互锁(刻意不合并):修改此处须
+    同步 ``vision/phash2.py`` 的 ``pyramid_distance``;两处实现由
     ``tests/test_phash_invariant.py`` 的一致性用例互相锁定。
     """
     ha = str(a).strip().lower()
@@ -298,6 +306,47 @@ def _pyramid_distance_hex(a: str, b: str) -> int:
         hamming(ha[i * seg:(i + 1) * seg], hb[i * seg:(i + 1) * seg])
         for i in range(3)
     )
+
+
+# ---------------------------------------------------------------------------
+# G3 · find_similar 分带预过滤(64bit 汉明路径的鸽笼剪枝)
+# ---------------------------------------------------------------------------
+
+#: 64bit 指纹的分带数(4 带 × 16bit,与 ``phash_lsh.DEFAULT_BANDS`` 同构;
+#: 带 i 覆盖位 [16i, 16(i+1)),四带不交且铺满 64 位)。
+_PREFILTER_BANDS = 4
+
+#: 各带的"异或后非零带"判定掩码(带 i 取值非零 ⇔ 该带内至少翻转 1 位)。
+_PREFILTER_BAND_MASKS: tuple[int, ...] = tuple(
+    0xFFFF << (16 * band) for band in range(_PREFILTER_BANDS)
+)
+
+
+def _diff_band_count(xor: int) -> int:
+    """64bit 异或值中取值非零的带数(4 带 × 16bit)。
+
+    **鸽笼论证(剪枝安全性的全部依据)**:设两哈希汉明距离为 d',则每个
+    翻转位恰落在一个带内,而"某带非零"⇔ 该带含 ≥1 个翻转位,不同非零
+    带的翻转位互不重叠,故 ``非零带数 ≤ d' = 汉明距离``。取逆否命题:
+    非零带数 > max_distance ⇒ 汉明距离 > max_distance ⇒ 该行必不命中,
+    可直接跳过精确计算——被跳过的行至多贡献一个 "> max_distance" 的
+    距离,不影响 ``min(distances)`` 的命中值,也不构成脏行。
+    """
+    return sum(1 for mask in _PREFILTER_BAND_MASKS if xor & mask)
+
+
+def _fast_hex64(value: str) -> int | None:
+    """值恰为 16 位 ASCII 小写十六进制时返回其 int 值,否则返回 None。
+
+    接受域与 :func:`hamming` 内部 ``_normalize_hex`` 对"已 strip+lower 的
+    16 hex"判定**完全一致**;任何不满足者(变长 / 非法字符 / unicode
+    数字 / ``0x`` 前缀等 ``int()`` 比 ``_normalize_hex`` 更宽容的输入)
+    都返回 None 交回原 ``hamming`` 口径处理,保证脏行(ValueError →
+    telemetry)语义逐位不变。调用方须先 ``strip().lower()``。
+    """
+    if len(value) == _HEX_LEN and _HEX_DIGITS.issuperset(value):
+        return int(value, 16)
+    return None
 
 
 class PhashRegistry:
@@ -319,6 +368,10 @@ class PhashRegistry:
     - ``stats()``:``{"total": 记录数, "sites": 去重站点数}``;
     - ``close()``:关闭连接(幂等),支持 ``with`` 上下文。
 
+    :attr:`find_exact_compares`(G3):``find_similar`` 累计执行的**精确**
+    距离计算次数(分带预过滤剪掉的行不计;红线 31 操作计数口径,用于
+    剪枝效果度量与等价性对照,不影响任何查询行为)。
+
     线程安全:连接以 ``check_same_thread=False`` 建立且所有读写都经
     ``self._lock`` 串行化,可在扫描 / 复核线程间共用一个实例。
     """
@@ -326,6 +379,9 @@ class PhashRegistry:
     def __init__(self, db_path: str) -> None:
         self.db_path = str(db_path)
         self._lock = threading.Lock()
+        #: find_similar 累计精确距离计算次数(G3 操作计数;诊断用,
+        #: 并发下可能少计,不影响查询结果)。
+        self.find_exact_compares = 0
         parent = Path(self.db_path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
@@ -358,16 +414,17 @@ class PhashRegistry:
     def _open(self) -> sqlite3.Connection:
         """打开(或新建)数据库;文件损坏时删除重建为空库。
 
-        V5:两个路径都启用 ``PRAGMA journal_mode=WAL``(读写不互相阻塞,
-        扫描线程登记与复核线程查询可并发)与 ``busy_timeout=5000``
-        (跨连接短暂锁竞争时等待重试,替代立即抛 ``database is locked``)。
+        V5:两个路径的连接统一 WAL(读写不互相阻塞,扫描线程登记与
+        复核线程查询可并发)与 ``busy_timeout=5000``(跨连接短暂锁
+        竞争时等待重试,替代立即抛 ``database is locked``)。V10.21:
+        连接统一经 :func:`netsentinel.storage.kernel.connect` 工厂
+        (全仓唯一 ``sqlite3.connect`` 入口,PRAGMA 由工厂内置,口径不变)。
         A219:两个路径都经 :meth:`_ensure_schema` 建表 + v1 旧库补列。
         """
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn: sqlite3.Connection | None = None
         try:
+            conn = sqlite_connect(self.db_path)
             conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA journal_mode = WAL")
             self._ensure_schema(conn)
             conn.commit()
             return conn
@@ -378,13 +435,12 @@ class PhashRegistry:
                 exc_info=True,
             )
             telemetry.inc("phash.rebuild")
-            conn.close()
+            if conn is not None:  # 工厂自抛时已自关,这里兜底幂等
+                conn.close()
             for suffix in ("", "-wal", "-shm", "-journal"):
                 Path(self.db_path + suffix).unlink(missing_ok=True)
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = sqlite_connect(self.db_path)
             conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA journal_mode = WAL")
             self._ensure_schema(conn)
             conn.commit()
             return conn
@@ -434,6 +490,70 @@ class PhashRegistry:
             self._conn.commit()
         logger.debug("已登记图片哈希:sha=%s… site=%s", sha[:12], site_url)
 
+    def register_many(
+        self,
+        rows: "Iterable[tuple[str, ...] | list[str]]",
+    ) -> int:
+        """批量登记(V10.13):整批**一次** executemany + 单次 commit。
+
+        - 行形态:``(sha256, phash_hex, site_url)`` 或扩展
+          ``(sha256, phash_hex, site_url, verdict_tag, mirror_hash,
+          pyramid_hash)``(后三项可省,缺省与逐条 :meth:`register` 一致);
+        - **先全量校验再写库**:任一行非法(空 sha / 非法十六进制 / 长度
+          不符)在任何写入发生前抛中文 ValueError——整批不落半截数据
+          (比逐条登记"写到一半失败"更安全);
+        - UPSERT 语义与逐条调用完全一致(同 sha 覆盖、可选列缺省置空、
+          批内同 sha 后行覆盖前行 = 顺序执行语义);
+        - 性能:N 行从 N 次单行事务(各一次 WAL fsync)降为 1 次——
+          批量登记步(kernel_wire 每站逐图登记)的主要写放大来源;
+        - 空批零操作返回 0。
+
+        :return: 实际写入的行数。
+        """
+        normalized: list[tuple[str, str, str, str, str, str, str]] = []
+        for row in rows or []:
+            item = tuple(row)
+            if len(item) < 3:
+                raise ValueError(
+                    f"register_many 每行至少 3 元组(sha256, phash_hex, site_url):{item!r}"
+                )
+            sha = str(item[0] or "").strip().lower()
+            if not sha:
+                raise ValueError("sha256 不能为空")
+            h = _normalize_hex(item[1], "phash")
+            tag = str(item[3]) if len(item) > 3 and item[3] is not None else ""
+            m = _normalize_len_hex(
+                item[4] if len(item) > 4 else None,
+                "mirror_hash",
+                MIRROR_HASH_HEX_LEN,
+            )
+            p = _normalize_len_hex(
+                item[5] if len(item) > 5 else None,
+                "pyramid_hash",
+                PYRAMID_HASH_HEX_LEN,
+            )
+            normalized.append(
+                (sha, h, str(item[2]), tag, now_iso(), m, p)
+            )
+        if not normalized:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO hashes (sha256, phash, site_url, verdict_tag, "
+                "created_at, mirror_hash, pyramid_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(sha256) DO UPDATE SET "
+                "phash = excluded.phash, site_url = excluded.site_url, "
+                "verdict_tag = excluded.verdict_tag, "
+                "created_at = excluded.created_at, "
+                "mirror_hash = excluded.mirror_hash, "
+                "pyramid_hash = excluded.pyramid_hash",
+                normalized,
+            )
+            self._conn.commit()
+        logger.debug("批量登记图片哈希:%d 条", len(normalized))
+        return len(normalized)
+
     def find_similar(
         self,
         phash_hex: str,
@@ -468,6 +588,25 @@ class PhashRegistry:
         结果条数超过 :data:`MAX_FIND_RESULTS`(默认 200)时截断到上限并记
         warning 提示;每次查询命中数累加 ``telemetry.inc("phash.registry_hit",
         len(results))``(只存数字,红线 17)。
+
+        G3 分带预过滤(64bit 汉明路径):``hash_kind`` ∈ {"phash", "mirror"}
+        且查询为 16 hex 定长时,查询串只归一化 / 转 int 一次,行值经
+        :func:`_fast_hex64` 快速判定后把 64bit 异或按 **4 带 × 16bit** 预拆,
+        非零带数 > max_distance 的行(鸽笼下界 ⇒ 汉明距离必 > max_distance)
+        直接跳过精确计算。约束与边界:
+
+        - **输出逐位不变**:被短路行至多贡献一个 "> max_distance" 的距离,
+          不影响 ``min``、命中、排序、截断;被短路的行**不是脏行**(旧口径
+          会算出距离、只是不命中),故 ``phash.dirty_hash`` 遥测只在
+          "无可比列且确有脏列"时照旧触发;
+        - **有效域**:非零带数 ≤ 4,故 max_distance ≤ 3(紧阈值,如
+          kernel_wire 复核口的 d=0 精确查重)才有剪枝;max_distance ≥ 4
+          时退化为"查询摊销 + 整数直算"的等价快速路径(不再逐行重校验
+          查询串),行为与旧口径完全一致;
+        - **pyramid 保持原路径**:其距离为三层取 min,剪枝需三层下界
+          同时 > max_distance 才安全,有效域极窄、复杂度不抵收益
+          (诚实边界,宁缺毋滥);
+        - :attr:`find_exact_compares` 按实际精确计算累加(剪枝效果度量)。
         """
         if hash_kind not in HASH_KINDS:
             raise ValueError(
@@ -498,25 +637,45 @@ class PhashRegistry:
             rows = self._conn.execute(
                 "SELECT sha256, phash, site_url, mirror_hash, pyramid_hash FROM hashes"
             ).fetchall()
+        # G3 分带预过滤开关:仅 64bit 定长 + 汉明比较(phash 16hex 查询 /
+        # mirror)启用;查询只转一次 int(摊销旧的逐行 hamming 重校验)。
+        use_bands = hash_kind != "pyramid" and len(query) == _HEX_LEN
+        query_value = int(query, 16) if use_bands else 0
         results: list[dict[str, Any]] = []
+        exact_compares = 0
         for row in rows:
             sha = str(row["sha256"])
             if exclude and sha == exclude:
                 continue
             distances: list[int] = []
             dirty = False
+            band_skipped = False  # 有列被分带短路(距离必 > max_distance,非脏)
             for column in columns:
                 value = str(row[column] or "").strip().lower()
                 if not value:
                     if column == "phash":
                         dirty = True  # phash 列为空 = 脏记录(与旧口径一致)
                     continue  # kind 主列为空 = 未登记该指纹 → 回退 phash 列
+                fast_value = _fast_hex64(value) if use_bands else None
+                if fast_value is not None:
+                    xor = query_value ^ fast_value
+                    if _diff_band_count(xor) > max_distance:
+                        # 鸽笼下界:汉明距离 ≥ 非零带数 > max_distance,
+                        # 该列必不命中 → 跳过精确计算,输出语义逐位不变。
+                        band_skipped = True
+                        continue
+                    distances.append(xor.bit_count())
+                    exact_compares += 1
+                    continue
                 try:
                     distances.append(compare(query, value))
+                    exact_compares += 1
                 except ValueError:
                     dirty = True  # 长度不匹配 / 非法十六进制:按脏哈希口径处理
             if not distances:
-                if dirty:
+                if dirty and not band_skipped:
+                    # band_skipped 时该行至少有一列"可比但远"(旧口径算出
+                    # 距离只是不命中),不得计入脏行遥测——口径逐位保持。
                     logger.debug("跳过库中无法比较的哈希记录:sha=%s kind=%s", sha, hash_kind)
                     telemetry.inc("phash.dirty_hash")
                 continue
@@ -529,6 +688,7 @@ class PhashRegistry:
                         "distance": distance,
                     }
                 )
+        self.find_exact_compares += exact_compares
         results.sort(key=lambda item: (item["distance"], item["sha256"]))
         if len(results) > MAX_FIND_RESULTS:
             logger.warning(

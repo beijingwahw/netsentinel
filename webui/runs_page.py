@@ -16,7 +16,7 @@ dashboard.py / providers_page.py / groups_page.py / models_page.py)。
   * :func:`cpu_advice` CPU 画像 → 中文建议(≤2 核低档 / ≤8 核中档 /
     >8 核高档压榨本地计算,对外频控不变);
   * :func:`advice_tier` CPU 画像 → 建议档位名(low/mid/high,同阈值);
-  * :func:`dist_line`  判定分布 dict → 中文一行串("未发现 2 / 疑似 1 /
+  * :func:`dist_line`  判定分布 dict → 中文一行串("未见违规 2 / 疑似 1 /
     高置信 3";固定三档顺序,未知档位原样保留)。
 - UI 层(下半部分,streamlit 顶部惰性 try/except,缺依赖时 main() 打印
   中文安装提示并返回退出码 1):
@@ -50,6 +50,14 @@ except ImportError:  # pragma: no cover - 取决于运行环境
     st = None  # type: ignore[assignment]
     _HAS_ST = False
 
+# ---------------------------------------------------------------------------
+# 共享标签口径(webui/_labels.py 单一权威定义;双路导入兼容脚本直跑)
+# ---------------------------------------------------------------------------
+try:
+    from webui._labels import VERDICT_CN
+except ImportError:  # streamlit run webui/runs_page.py 时 sys.path[0]=webui/
+    from _labels import VERDICT_CN  # type: ignore[no-redef]
+
 __all__ = [
     "ADVICE_HIGH",
     "ADVICE_LOW",
@@ -81,12 +89,9 @@ BADGE_HIGH: str = "🔴 高(全压榨)"
 #: 未知档位徽章(空串 / 拼写错 / 非字符串一律落到这里,保留排查线索)。
 BADGE_UNKNOWN: str = "❓ 未知档位"
 
-#: 判定档位 → 中文标签(A175 口径:未发现/疑似/高置信)。
-VERDICT_LABELS_CN: dict[str, str] = {
-    "clean": "未发现",
-    "suspect": "疑似",
-    "nsfw": "高置信",
-}
+#: 判定档位 → 中文标签(A233 起口径统一:未见违规/疑似/高置信;权威定义
+#: 在 webui/_labels.py,本名为本页历史常量名,指向同一字典对象)。
+VERDICT_LABELS_CN: dict[str, str] = VERDICT_CN
 
 #: 判定分布的固定展示顺序(clean → suspect → nsfw,由轻到重;与 A117
 #: ``group_stats.verdict_dist`` 三键恒在的口径对齐,0 也如实展示)。
@@ -267,10 +272,10 @@ def advice_tier(profile: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def dist_line(verdict_dist: Any) -> str:
-    """判定分布 dict → 中文一行串("未发现 2 / 疑似 1 / 高置信 3")。
+    """判定分布 dict → 中文一行串("未见违规 2 / 疑似 1 / 高置信 3")。
 
     - 已知三档(clean / suspect / nsfw)映射 :data:`VERDICT_LABELS_CN`
-      (未发现 / 疑似 / 高置信),并**固定按由轻到重的顺序**输出——与入参
+      (未见违规 / 疑似 / 高置信),并**固定按由轻到重的顺序**输出——与入参
       键序无关;计数为 0 也如实展示(A117 ``verdict_dist`` 三键恒在口径);
     - 未知档位键保留原样文本追加在已知三档之后(不丢弃排查线索);
     - 空分布 / ``None`` / 非字典(折不成 dict)→ :data:`_DIST_EMPTY`
@@ -279,7 +284,7 @@ def dist_line(verdict_dist: Any) -> str:
     示例::
 
         >>> dist_line({"clean": 2, "suspect": 1, "nsfw": 3})
-        '未发现 2 / 疑似 1 / 高置信 3'
+        '未见违规 2 / 疑似 1 / 高置信 3'
         >>> dist_line({"nsfw": 1})
         '高置信 1'
     """
@@ -336,7 +341,7 @@ def run_rows(summaries: list[dict] | None) -> list[dict]:
         >>> row["batch"], row["sites"], row["groups"], row["ready"]
         ('B1', 2, 2, 3)
         >>> row["verdict_cn"], row["tier_badge"]
-        ('未发现 1 / 高置信 1', '🔴 高(全压榨)')
+        ('未见违规 1 / 高置信 1', '🔴 高(全压榨)')
     """
     rows: list[dict] = []
     for item in summaries if isinstance(summaries, (list, tuple)) else []:
@@ -554,4 +559,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    # V10.20(SystemExit 收尾修复,同 webui/app.py):streamlit 脚本线程内
+    # 不抛 SystemExit(BaseException 会杀死脚本线程,AppTest 通道失效);
+    # 仅真直跑才转进程退出码(保留缺依赖提示退出码 1 契约)。
+    _in_script_thread = False
+    if _HAS_ST:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+            _in_script_thread = get_script_run_ctx() is not None
+        except Exception:  # noqa: BLE001 - 内部 API 缺席按直跑处理
+            _in_script_thread = False
+    if not _in_script_thread:
+        raise SystemExit(_exit_code)

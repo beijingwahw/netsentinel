@@ -320,3 +320,135 @@ def test_v5_final_text_single_pass_preserves_order_and_raw_values() -> None:
     assert content.count("(") == 1 and content.count(")") == 1  # 恰一对括号
     bare = _build_payload("feishu", "e", "纯文本", {})["content"]["text"]
     assert "()" not in bare and _TS_RE.search(bare)
+
+
+# ---------------------------------------------------------------------------
+# V10.35(P2-8):有界重试(opt-in;缺省 0 = 单发不重试逐字节旧行为)
+# ---------------------------------------------------------------------------
+class FlakyRecorder:
+    """前 N 次抛 URLError、之后成功的假 urlopen;记录每次调用与休眠。"""
+
+    def __init__(self, fail_times: int = 1) -> None:
+        self.fail_times = fail_times
+        self.calls = 0
+        self.sleeps: list[float] = []
+
+
+def _flaky(monkeypatch, fail_times: int) -> FlakyRecorder:
+    import netsentinel.notify.hub as hub
+
+    rec = FlakyRecorder(fail_times)
+
+    def fake_urlopen(request, timeout=10):  # noqa: ANN001
+        rec.calls += 1
+        if rec.calls <= rec.fail_times:
+            raise urllib.error.URLError("模拟网络抖动")
+        return FakeResponse()
+
+    def fake_sleep(seconds: float) -> None:
+        rec.sleeps.append(float(seconds))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(hub, "_sleep", fake_sleep)
+    return rec
+
+
+def test_retry_default_zero_single_shot_byte_identical(monkeypatch) -> None:
+    telemetry.reset()
+    rec = _flaky(monkeypatch, fail_times=1)
+    cfg = Config(notify_webhook=GENERIC_URL)  # notify_retry_max 缺省 0
+    assert notify(cfg, "pending_review", "x") is False
+    assert rec.calls == 1                 # 只发一次,绝不重试(V2 红线缺省)
+    assert rec.sleeps == []               # 零退避等待
+    snap = telemetry.snapshot()["counters"]
+    assert snap.get("notify.fail") == 1.0
+    assert snap.get("notify.retry") is None
+    telemetry.reset()
+
+
+def test_retry_success_on_second_attempt(monkeypatch) -> None:
+    telemetry.reset()
+    rec = _flaky(monkeypatch, fail_times=1)
+    cfg = Config(
+        notify_webhook=GENERIC_URL, notify_retry_max=2, notify_retry_backoff_s=5.0
+    )
+    assert notify(cfg, "pending_review", "x") is True
+    assert rec.calls == 2                 # 首败 + 重试成功
+    assert rec.sleeps == [5.0]            # 基础退避起步
+    snap = telemetry.snapshot()["counters"]
+    assert snap.get("notify.sent") == 1.0
+    assert snap.get("notify.retry") == 1.0
+    assert snap.get("notify.fail") is None  # 终态恰一次:成功不算失败
+    telemetry.reset()
+
+
+def test_retry_exhausted_counts_fail_once(monkeypatch) -> None:
+    telemetry.reset()
+    rec = _flaky(monkeypatch, fail_times=99)  # 永远失败
+    cfg = Config(
+        notify_webhook=GENERIC_URL, notify_retry_max=2, notify_retry_backoff_s=1.0
+    )
+    assert notify(cfg, "pending_review", "x") is False
+    assert rec.calls == 3                 # 1 次首发 + 2 次重试,恰为上界
+    assert rec.sleeps == [1.0, 2.0]       # 指数翻倍
+    snap = telemetry.snapshot()["counters"]
+    assert snap.get("notify.fail") == 1.0 # 终态计数恰一次
+    assert snap.get("notify.retry") == 2.0
+    telemetry.reset()
+
+
+def test_retry_backoff_doubles_each_time(monkeypatch) -> None:
+    telemetry.reset()
+    rec = _flaky(monkeypatch, fail_times=2)
+    cfg = Config(
+        notify_webhook=GENERIC_URL, notify_retry_max=3, notify_retry_backoff_s=2.0
+    )
+    assert notify(cfg, "ev", "y") is True
+    assert rec.sleeps == [2.0, 4.0]       # 两次重试的退避序列
+    telemetry.reset()
+
+
+def test_retry_zero_backoff_immediate(monkeypatch) -> None:
+    telemetry.reset()
+    rec = _flaky(monkeypatch, fail_times=1)
+    cfg = Config(
+        notify_webhook=GENERIC_URL, notify_retry_max=1, notify_retry_backoff_s=0.0
+    )
+    assert notify(cfg, "ev", "y") is True
+    assert rec.sleeps == [0.0]            # 0 退避 = 立即重试(本机测试形态)
+    telemetry.reset()
+
+
+def test_retry_payload_identical_each_attempt(monkeypatch) -> None:
+    """重发的是同一载荷(只重发通知,绝不重发动作;字节一致)。"""
+    telemetry.reset()
+    import netsentinel.notify.hub as hub
+
+    monkeypatch.setattr(hub, "_sleep", lambda s: None)
+    bodies: list[bytes] = []
+
+    def urlopen_grab(request, timeout=10):  # noqa: ANN001
+        bodies.append(request.data)
+        if len(bodies) <= 2:
+            raise urllib.error.URLError("fail")
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen_grab)
+    cfg = Config(
+        notify_webhook=GENERIC_URL, notify_retry_max=2, notify_retry_backoff_s=0.0
+    )
+    assert notify(cfg, "ev", "z", k=1) is True
+    assert len(bodies) == 3
+    assert bodies[0] == bodies[1] == bodies[2]
+    telemetry.reset()
+
+
+def test_retry_negative_backoff_clamped_to_zero(monkeypatch) -> None:
+    telemetry.reset()
+    rec = _flaky(monkeypatch, fail_times=1)
+    cfg = Config(
+        notify_webhook=GENERIC_URL, notify_retry_max=1, notify_retry_backoff_s=-5.0
+    )
+    assert notify(cfg, "ev", "y") is True
+    assert rec.sleeps == [0.0]            # 负退避钳到 0(绝不倒贴时间)
+    telemetry.reset()

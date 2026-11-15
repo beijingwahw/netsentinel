@@ -18,7 +18,9 @@
   安全红线:**不杜撰接口细节**——凡未在官方公开文档核实的字段一律不进
   ``extra_headers``/``model_aliases``/``response_quirk``,只放 ``notes`` 并标注
   "以官方文档为准"。调研于 2026-10-01 经各平台公开文档页核对(见模块末尾
-  调研记录);核对失败的条目保留 TODO,不阻塞开发。
+  调研记录);核对失败的条目保留 TODO,不阻塞开发。各 TODO 涉及平台的
+  背景与注意事项见 docs/PROVIDERS.md §3"每平台一节"(如 §3.5 qwen、
+  §3.6 doubao)。
 
 - :func:`apply_quirks`:容器逐层新建、不可变叶子共享的等价拷贝(V5:取代
   :func:`copy.deepcopy`,返回对象与入参在任何**容器**层级都不共享可变结构)
@@ -85,6 +87,8 @@ QUIRKS: dict[str, dict[str, Any]] = {
     },
     # ------------------------------------------------------------------
     # 通义千问 Qwen(阿里云百炼 DashScope 兼容模式)
+    # TODO 旁注:下方 notes 里的 TODO(官方兼容模式可选头)背景见
+    # docs/PROVIDERS.md §3.5"qwen 通义千问"。
     # ------------------------------------------------------------------
     "qwen": {
         "notes": (
@@ -378,4 +382,5 @@ def quirk_notes(provider: str) -> str:
 #   - doubao:docs.volcengine.com 页面为脚本渲染,WebFetch 抓取为空;接入点
 #     ep-xxxx / 模型 ID 双形态经官方 api.volcengine.com 文档检索摘要与契约
 #     §2 交叉确证,建议 vlmctl ping 时复核。
+#     (平台背景与复核指引见 docs/PROVIDERS.md §3.6"doubao 豆包"。)
 #   - 各平台具体限流数值/单价随官方调整,一律以官方文档为准(红线 18)。

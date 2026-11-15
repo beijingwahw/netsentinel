@@ -43,6 +43,13 @@ python -m netsentinel.batchflow --input leads.txt
 
 ## 备选引擎
 
+- **yandex-html**(V10.23 内置 Yandex 网页内核,免 XML API 凭据):`--engine yandex-html`
+  直接读取 Yandex 网页检索结果页并解析自然结果链接;双通道传输——浏览器
+  (Playwright Chromium,需 `pip install -e ".[browser]"` + `playwright install chromium`,
+  auto 模式下在席即优先)或纯 HTTP(`--transport http` 或 `yandex_html_transport: http`,
+  低频家用网络通常可用);**验证码/反爬页命中即停**(红线 1:绝不自动识别或绕过,
+  中文报错并给出放慢/换通道/XML API 建议);搜索站点域名可经 `yandex_html_base`
+  配置项显式指定(如 `https://yandex.com/search/`;留空 = 内置默认 yandex.com);
 - **SearXNG**(自托管,无第三方 ToS 顾虑):`discovery_engine: searxng` +
   `searxng_base_url: http://127.0.0.1:8888`(实例需开启 `format=json`);
 - **mock**(离线测试):`--engine mock`,确定性生成结果,用于管线演练。
@@ -51,7 +58,26 @@ python -m netsentinel.batchflow --input leads.txt
 
 - 来源:`--keywords 词1,词2` 内联 / `--keywords-file k.txt`(每行一词,`#` 注释)/ `.yaml`(`[词...]` 或 `keywords: [...]`);
 - 模板(可选,运营者自拟):`--template "{kw} site:cn" --template "报告 {kw}"`,支持 `{kw}` 占位符;默认原样查询;
+- 模板文件(V10.20,可选):`--template-file data/keywords/templates.txt`,每行一模板(`{kw}` 占位符、`#` 注释),与 `--template` 叠加去重(文件在前);不传则默认原样查询,行为不变;
 - 去空、去重、保序;空词表直接报错(零内置)。
+
+### 关键词工作台(网页实时编辑/切换)
+
+`streamlit run webui/keywords_page.py` 打开关键词工作台:在浏览器里维护
+`<data>/keywords/active.txt`(**当前关键词活文件**)与命名词组库——编辑保存、
+词组一键启用切换、展开预览(关键词 × 模板 → 实际查询,纯本地)。V10.20 起
+预览区的模板升级为**持久对象** `<data>/keywords/templates.txt`(页面内
+读取/编辑/保存/清空,与关键词同款原子写 + `.bak` 滚动;预览默认读它,
+临时输入可覆盖,命令提示自动追加 `--template-file`)。发现每次
+运行都重新装载关键词文件,因此**保存/切换后下一次发现运行即生效**;覆盖保存
+原子落盘并滚动备份 `.bak`。建议 CLI 固定使用:
+
+```bash
+python -m netsentinel.discovery --keywords-file data/keywords/active.txt --out leads.txt
+```
+
+页面本身零外呼、零内置关键词(红线 28 同源校验);发现运行仍受
+`discovery_online` 与引擎密钥门槛约束。
 
 ## 行为细节
 

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from netsentinel import telemetry
@@ -87,13 +88,19 @@ def ensemble_scores(
             effective: dict[str, float] = {m: 1.0 for m in members}
         else:
             effective = {m: float(weights.get(m, 1.0)) for m in members}
-        total = sum(effective.values())
+        # math.fsum:权重和与加权和均正确舍入求和——成员分输入重排(成员评分
+        # 到达顺序不同)时裸 sum 的左结合累加会在末位 ulp 上分歧,边界用例
+        # (加权均值数学上恰等于复核线 0.5,如成员分 0.2/0.65/0.25/0.9)一个
+        # 顺序算出 0.5、另一个顺序算出 0.49999999999999994,verdict 的
+        # ``agg >= threshold`` 硬比较随之翻档(仿 V10.12 decision/fusion 先例);
+        # fsum 后任意输入顺序逐位一致。
+        total = math.fsum(effective.values())
         if total <= 0.0:
             logger.warning("图片 %s 的成员权重总和 <= 0,改用等权平均兜底", path)
             effective = {m: 1.0 for m in members}
             total = float(len(members))
 
-        mean = sum(effective[m] * members[m] for m in members) / total
+        mean = math.fsum(effective[m] * members[m] for m in members) / total
 
         extra: dict[str, Any] = {"members": dict(members)}
         missing = [m for m in all_models if m not in members]

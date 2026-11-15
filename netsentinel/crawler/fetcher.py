@@ -20,15 +20,21 @@ V5 升级(行为兼容,仅增强):
 - 幂等 GET 的连接类错误(URLError 超时/连接重置)按指数退避重试,最多
   :data:`RETRY_MAX_ATTEMPTS` 次尝试;HTTP 4xx/5xx 与非连接类错误不重试;
 - robots.txt 校验结果按站点(netloc)进程内 TTL 缓存
-  (:data:`ROBOTS_CACHE_TTL_S`),避免逐页抓取时重复拉取;
+  (:data:`ROBOTS_CACHE_TTL_S`),避免逐页抓取时重复拉取;拉取走带超时
+  读取,失败也缓存(TTL 负缓存,见 :func:`_robots_parser_cached`);
 - 批量下载时同一 host 连续失败 :data:`HOST_FAILURE_LIMIT` 次即提前放弃
   本批该 host 的剩余 URL(记 warning 与 telemetry 计数);
 - 关键路径接入 ``netsentinel.telemetry``(fetch.page / fetch.image /
   fetch.retry / fetch.errors / fetch.host_abandoned)。
+
+创世纪 G1 升级(行为等价重构):安全闸门返回的目标 host 贯穿给 robots
+校验、批量下载循环把已解析 host 传入单张下载——同一 URL 的重复解析由
+3 次降为 1 次;URL 去重(seen)与 host 放弃判定口径不变。
 """
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
 import random
 import threading
@@ -52,8 +58,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: 对外声明的 User-Agent(契约固定值)
-USER_AGENT = "NetSentinel/0.1"
+#: 对外声明的 User-Agent(契约固定值)。与 ``discovery/yandex.py`` 的
+#: USER_AGENT、``crawler/redirect.py`` 的 _FALLBACK_USER_AGENT 为同一取值的
+#: 三处副本(包间零依赖,刻意不跨包引用;修改任何一处须同步其余两处)。
+USER_AGENT = "NetSentinel/0.17"
 
 #: HTML 响应体读取上限(2MB,超出截断)
 MAX_HTML_BYTES = 2 * 1024 * 1024
@@ -64,12 +72,19 @@ DEFAULT_IMAGE_EXT = ".jpg"
 #: 视为图片的 URL 路径后缀(响应头缺失 Content-Type 时的放行依据)
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico"})
 
-#: 默认策略下放行的本机 host
-_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
+#: 默认策略下放行的本机 host。回环口径三处统一(修改任何一处须同步):
+#: crawler/fetcher.py、crawler/browser.py、crawler/redirect.py——都认
+#: 127.0.0.1 / localhost / ::1,且经 :func:`_is_loopback_host` 放行整个
+#: 127.0.0.0/8 段与 ::1(不离开本机)。
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def _is_loopback_host(host: str) -> bool:
-    """127.0.0.0/8 全段与 ::1 均为本机回环,放行(不离开本机)。"""
+    """127.0.0.0/8 全段与 ::1 均为本机回环,放行(不离开本机)。
+
+    与 crawler/browser.py 的同名函数为镜像实现(口径锁:127/8 + ::1);
+    修改此处须同步 browser.py 与 redirect.py 的回环判定。
+    """
     import ipaddress
 
     try:
@@ -89,6 +104,10 @@ RETRY_BACKOFF_JITTER = 0.25
 #: robots.txt 结果进程内缓存有效期(秒;V5)
 ROBOTS_CACHE_TTL_S = 60.0
 
+#: robots.txt 单次拉取超时(秒):外网站点 robots 服务挂起时兜底,
+#: 避免无超时的 ``RobotFileParser.read`` 逐页阻塞抓取主流程。
+ROBOTS_FETCH_TIMEOUT_S = 10.0
+
 #: 批量下载时同一 host 连续失败达到该次数即提前放弃本批该 host(V5)
 HOST_FAILURE_LIMIT = 3
 
@@ -102,8 +121,10 @@ _RETRYABLE_REASONS: tuple[type[BaseException], ...] = (
     BrokenPipeError,
 )
 
-#: robots 缓存:netloc(小写)-> (写入时刻 time.monotonic,已成功 read 的 parser)
-_ROBOTS_CACHE: dict[str, tuple[float, urllib.robotparser.RobotFileParser]] = {}
+#: robots 缓存:netloc(小写)-> (写入时刻 time.monotonic, parser 或 None)。
+#: 值为 None 表示该站点 robots.txt 上次拉取失败的**负缓存**条目(TTL 内
+#: 不再重试,避免每个页面都对挂起/不可达的 robots 端点再挂起一次)。
+_ROBOTS_CACHE: dict[str, tuple[float, urllib.robotparser.RobotFileParser | None]] = {}
 _ROBOTS_CACHE_LOCK = threading.Lock()
 
 
@@ -123,12 +144,16 @@ def _url_host(url: str) -> str:
         return ""
 
 
-def _gate_network_access(url: str, cfg: Config) -> str:
+def _gate_network_access(url: str, cfg: Config, *, host: str | None = None) -> str:
     """安全闸门:allow_network=False 时仅放行本机地址,返回目标 host。
 
     非本机地址直接抛 :class:`NetworkDisabledError`,不会发出任何真实请求。
+    ``host`` 可传入已解析好的目标 host(创世纪 G1 消重:批量下载循环里
+    已为失败统计解析过一次,贯穿复用,免同一 URL 重复解析);缺省 None
+    时自行解析,单页调用方语义不变。
     """
-    host = _url_host(url)
+    if host is None:
+        host = _url_host(url)
     if cfg.allow_network or host in _LOCAL_HOSTS or _is_loopback_host(host):
         return host
     raise NetworkDisabledError(
@@ -193,44 +218,82 @@ def _urlopen_with_retry(request: urllib.request.Request, timeout: float) -> Any:
     raise AssertionError("重试循环不可能正常退出")  # pragma: no cover
 
 
+def _read_robots_into_parser(
+    robots_url: str, parser: urllib.robotparser.RobotFileParser
+) -> None:
+    """带超时拉取 robots.txt 并逐行喂给 parser(替代无超时的 ``parser.read``)。
+
+    HTTP 语义与标准库 ``RobotFileParser.read`` 逐项对齐:
+
+    - 401/403 → ``disallow_all``(站点明确拒绝,礼貌抓取一律禁止);
+    - 其余 4xx → ``allow_all``(robots.txt 不存在等,按可抓取处理);
+    - 5xx 与标准库口径一致不设置任何标志(空规则默认允许),照常返回;
+    - URLError / OSError(DNS 失败、断网、超时等连接层错误)向上抛出,
+      由 :func:`_robots_parser_cached` 按"获取失败"走 TTL 负缓存路径。
+    """
+    request = urllib.request.Request(robots_url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=ROBOTS_FETCH_TIMEOUT_S) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            parser.disallow_all = True
+        elif 400 <= exc.code < 500:
+            parser.allow_all = True
+        return
+    parser.parse(raw.decode("utf-8", errors="replace").splitlines())
+
+
 def _robots_parser_cached(robots_url: str) -> urllib.robotparser.RobotFileParser | None:
     """取 robots parser:命中未过期的进程内缓存则复用,否则拉取并缓存(V5)。
 
     - 缓存键为 robots_url 的 netloc(小写,含端口),同一站点在
       :data:`ROBOTS_CACHE_TTL_S` 内只拉取一次,避免逐页抓取时的重复请求;
-    - robots.txt 自身获取失败(网络抖动)按"允许"处理并留痕,且**不缓存**,
-      下次校验仍会尝试重新拉取;
-    - 返回 None 表示读取失败(调用方按允许放行)。
+    - robots.txt 经带超时的 :func:`_read_robots_into_parser` 拉取
+      (:data:`ROBOTS_FETCH_TIMEOUT_S` 兜底:外网站点 robots 服务挂起时
+      不再沿无超时的 ``parser.read`` 无限期阻塞);
+    - robots.txt 自身获取失败(网络抖动/DNS 失败/超时)按"允许"处理并
+      留痕,且写入 **TTL 负缓存**(值为 None):失败也缓存,TTL 内同站
+      后续校验直接复用失败结论、不再重试——避免外网站点 robots 端点
+      挂起时每个页面都重新挂起一次;
+    - 返回 None 表示读取失败或命中负缓存条目(调用方按允许放行)。
     """
     key = urllib.parse.urlsplit(robots_url).netloc.lower()
     now = time.monotonic()
     with _ROBOTS_CACHE_LOCK:
         entry = _ROBOTS_CACHE.get(key)
         if entry is not None and now - entry[0] < ROBOTS_CACHE_TTL_S:
-            return entry[1]
+            return entry[1]  # 可能为 None(负缓存:上次失败,按允许放行)
     parser = urllib.robotparser.RobotFileParser()
     parser.set_url(robots_url)
     try:
-        parser.read()
+        _read_robots_into_parser(robots_url, parser)
     except (urllib.error.URLError, OSError) as exc:
-        # robots.txt 自身获取失败(如网络抖动)时按"允许"处理并留痕
+        # robots.txt 自身获取失败(如网络抖动)时按"允许"处理并留痕;
+        # 失败同样入缓存(TTL 负缓存),TTL 内不再对同站重试。
         logger.warning("robots.txt 获取失败,按允许处理:%s(%s)", robots_url, exc)
+        with _ROBOTS_CACHE_LOCK:
+            _ROBOTS_CACHE[key] = (time.monotonic(), None)
         return None
     with _ROBOTS_CACHE_LOCK:
         _ROBOTS_CACHE[key] = (time.monotonic(), parser)
     return parser
 
 
-def _check_robots(url: str, cfg: Config) -> None:
+def _check_robots(url: str, cfg: Config, *, host: str | None = None) -> None:
     """robots.txt 校验:仅针对真实外网目标;本机地址一律跳过。
 
     只会在安全闸门放行之后才会执行,因此本函数内的 robots.txt 读取
     只可能发生在 allow_network=True 且目标为外网时。校验结果经进程内
     TTL 缓存(:func:`_robots_parser_cached`)避免同站重复拉取。
+    ``host`` 可传入闸门已解析好的目标 host(创世纪 G1 消重:闸门与
+    robots 校验本就总是先后成对执行,复用免二次解析);缺省 None 时
+    自行解析,既有调用方语义不变。
     """
     if not cfg.respect_robots:
         return
-    host = _url_host(url)
+    if host is None:
+        host = _url_host(url)
     if not host or host in _LOCAL_HOSTS or _is_loopback_host(host):
         return  # 本机开发/测试服务不适用 robots
     parts = urllib.parse.urlsplit(url)
@@ -251,7 +314,7 @@ def _url_suffix(url: str) -> str:
 def fetch_page(url: str, cfg: Config) -> tuple[int, str, str]:
     """抓取单个页面,返回 ``(status, html, final_url)``。
 
-    - User-Agent 固定为 ``NetSentinel/0.1``,超时取 ``cfg.fetch_timeout_s``;
+    - User-Agent 固定为 ``NetSentinel/0.17``,超时取 ``cfg.fetch_timeout_s``;
     - 响应体最多读取 2MB,超出部分直接截断;
     - HTTP 错误码(HTTPError)不抛出:返回 ``(错误码, "", 最终 URL)``,
       且**不重试**;连接层错误中的超时/连接重置按指数退避重试(<= 2 次,
@@ -264,8 +327,8 @@ def fetch_page(url: str, cfg: Config) -> tuple[int, str, str]:
     - 遥测:``fetch.page`` 计时(含重试)、``fetch.page`` /
       ``fetch.page.<status>`` 计数、连接失败再计 ``fetch.errors``。
     """
-    _gate_network_access(url, cfg)
-    _check_robots(url, cfg)
+    host = _gate_network_access(url, cfg)
+    _check_robots(url, cfg, host=host)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with telemetry.timer("fetch.page"):
         try:
@@ -287,14 +350,23 @@ def fetch_page(url: str, cfg: Config) -> tuple[int, str, str]:
     return status, html, final_url
 
 
-def _download_one(url: str, source_page: str, dest: Path, cfg: Config) -> ImageEvidence | None:
+def _download_one(
+    url: str,
+    source_page: str,
+    dest: Path,
+    cfg: Config,
+    *,
+    host: str | None = None,
+) -> ImageEvidence | None:
     """下载单张图片并落盘;不满足条件的资源返回 None(由调用方跳过)。
 
     安全闸门与 robots 校验同 :func:`fetch_page`;连接类错误同样走指数退避
     重试(:func:`_urlopen_with_retry`);整体耗时记 ``telemetry.timer("fetch.image")``。
+    ``host`` 可传入批量循环已解析好的目标 host(创世纪 G1 消重:闸门返回
+    值贯穿给 robots 校验,同一 URL 免去 2 次重复解析);缺省 None 时自行解析。
     """
-    _gate_network_access(url, cfg)
-    _check_robots(url, cfg)
+    host = _gate_network_access(url, cfg, host=host)
+    _check_robots(url, cfg, host=host)
     limit_bytes = max(0, int(cfg.max_image_mb)) * 1024 * 1024
     suffix = _url_suffix(url)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -371,7 +443,7 @@ def download_images(
         if requested and cfg.fetch_delay_s > 0:
             time.sleep(cfg.fetch_delay_s)
         try:
-            evidence = _download_one(url, source_page, dest, cfg)
+            evidence = _download_one(url, source_page, dest, cfg, host=host)
         except (NetworkDisabledError, RobotsDeniedError):
             # 策略性拦截必须向上冒泡,不能被"单张失败继续"吞掉
             raise
@@ -382,7 +454,13 @@ def download_images(
             consecutive_failures[host] = failures
             if failures >= HOST_FAILURE_LIMIT:
                 abandoned_hosts.add(host)
-                remaining = sum(1 for other in urls[index + 1 :] if _url_host(other) == host)
+                # islice 免拷贝剩余清单(V10.12):仅为一条告警计数,
+                # 不复制 urls[index+1:] 整段列表。
+                remaining = sum(
+                    1
+                    for other in itertools.islice(urls, index + 1, None)
+                    if _url_host(other) == host
+                )
                 telemetry.inc("fetch.host_abandoned")
                 logger.warning(
                     "同一 host 连续失败 %d 次,提前放弃本批该 host 的剩余 %d 个 URL:host=%s",

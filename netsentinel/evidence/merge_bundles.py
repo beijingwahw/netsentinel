@@ -60,9 +60,12 @@ counter ``merge_bundles.files``(去重后证据文件数)、
     merged = merge_bundles(sub_bundles, out_dir, cfg=cfg)  # A214:同策略签名
 
 仅使用标准库:json / zipfile / hashlib / shutil / stat / pathlib /
-datetime / typing。除签名步对 A205 ``packager.sign_bundle`` 的惰性
-只读复用(cfg 传入且显式配置 ed25519 时才触发 import)外零兄弟模块
-依赖(常量与 packager 同款自带,并行开发互不阻塞)。
+typing,以及基座级时间源 :mod:`netsentinel.timesource`(V10.21 席位2
+时间源单源化,目录名时间戳改经 ``timesource.now_local().strftime``,
+strftime 墙钟输出与原 naive ``datetime.now()`` 逐字节等价)。除签名步对
+A205 ``packager.sign_bundle`` 的惰性只读复用(cfg 传入且显式配置
+ed25519 时才触发 import)外零兄弟模块依赖(常量与 packager 同款自带,
+并行开发互不阻塞)。
 """
 from __future__ import annotations
 
@@ -72,11 +75,11 @@ import logging
 import shutil
 import stat as _stat
 import zipfile
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from netsentinel import telemetry
+from netsentinel import timesource
 from netsentinel.contracts import EvidenceBundle, now_iso
 
 __all__ = [
@@ -167,7 +170,11 @@ def _read_manifest(bundle: Any) -> dict[str, Any] | None:
         )
         return None
     try:
-        raw = json.loads(target.read_text(encoding="utf-8-sig"))
+        # V10.18:流式读取——json.load 直接吃文件对象,免 read_text 先复制
+        # 一份完整字符串再解析(大 manifest 少一份瞬时拷贝);utf-8-sig
+        # BOM 容错与异常语义(损坏 → warning + None)与原实现逐字节等价。
+        with open(target, encoding="utf-8-sig") as fh:
+            raw = json.load(fh)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning("子包 manifest 损坏,已跳过:%s(%s)", target, exc)
         return None
@@ -186,7 +193,7 @@ def _fresh_merged_dir(out_root: Path) -> Path:
     时间戳秒级;同一秒内重复合并时追加序号避让(packager 同款策略),
     绝不混入上一份合并包的旧文件。``parents=True`` 自动创建多级父目录。
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = timesource.now_local().strftime("%Y%m%d_%H%M%S")
     candidate = out_root / f"{_MERGED_PREFIX}_{ts}"
     seq = 1
     while candidate.exists():

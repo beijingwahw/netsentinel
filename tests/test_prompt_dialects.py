@@ -562,7 +562,12 @@ def test_v5_caps_frozen_readonly() -> None:
 
 
 def test_v5_single_base64_encode_per_image(monkeypatch: pytest.MonkeyPatch) -> None:
-    """每张图恰好一次 b64 编码:三图三编、无图零编(编码单次产出锁定)。"""
+    """每张图恰好一次 b64 编码:三图三编、无图零编(编码单次产出锁定)。
+
+    (V17)口径更新:``_encode_image`` 改为 LRU 渲染缓存后,"每图恰好一次"
+    以**清空缓存后的单次渲染**计——同一图片跨渲染零重编码正是缓存目标
+    (缓存命中等价见 tests/test_genesis_vision.py)。
+    """
     from netsentinel.vision import prompt_dialects as pd
 
     real_encode = base64.b64encode
@@ -574,9 +579,11 @@ def test_v5_single_base64_encode_per_image(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(pd.base64, "b64encode", counting_encode)
     images = [(PNG_1X1, "image/png"), (b"\xff\xd8\xff\xe0-fake", "image/jpeg"), (b"zz", "")]
+    pd._encode_image.cache_clear()  # (V17)清渲染缓存后计数(缓存口径)
     build_request("openai", "openai", SYS, USER, images, model="m", base_url=BASE)
     assert counter["n"] == 3
     counter["n"] = 0
+    pd._encode_image.cache_clear()  # 同上:anthropic 渲染前同样清缓存
     build_request("anthropic", "anthropic", SYS, USER, images, model="m", base_url=BASE)
     assert counter["n"] == 3
     counter["n"] = 0

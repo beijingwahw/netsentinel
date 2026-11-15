@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import logging
-import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -26,6 +25,7 @@ from netsentinel.discovery.engines import (
     SearchEngine,
     SearchHit,
 )
+from netsentinel.storage.kernel import connect as sqlite_connect
 
 __all__ = ["discover", "write_leads", "main"]
 
@@ -54,6 +54,20 @@ def _host_of(url: str) -> str:
         return ""
 
 
+def _aware_local(dt: _dt.datetime) -> _dt.datetime:
+    """naive 时间戳按本地时区 aware 化;已带 tzinfo 原样返回(V10.18)。
+
+    写入侧 :meth:`_DiscoveryCache.put` 一律写 ``now().astimezone()``(带
+    tz),但历史版本/外部工具可能写入 naive ISO 串(无 tz 后缀)。读取比较
+    统一 aware 化:naive 按本地时区 attach——与写入侧本地墙钟口径一致,
+    且天然规避 naive 减法跨夏令时边界少算 1 小时的退化;aware 条目的
+    判定结果与旧式 ``now(created.tzinfo)`` 写法逐秒等价。
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_dt.datetime.now().astimezone().tzinfo)
+    return dt
+
+
 class _DiscoveryCache:
     """查询结果缓存(sqlite,TTL 小时),键=(engine, query, limit)。"""
 
@@ -63,7 +77,11 @@ class _DiscoveryCache:
         path = Path(db_path)
         if str(path.parent):
             path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        # V10.21:连接统一经 storage.kernel.connect 工厂(全仓唯一
+        # sqlite3.connect 入口);V10.18 手补的 WAL + busy_timeout PRAGMA
+        # 随之收敛进工厂(口径不变:多终端并行跑 discovery 命令访问同一
+        # 缓存文件时不抛 SQLITE_BUSY)。
+        self._conn = sqlite_connect(str(path))
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS queries ("
             "engine TEXT, query TEXT, limit_n INTEGER, urls TEXT, created_at TEXT,"
@@ -81,10 +99,13 @@ class _DiscoveryCache:
             return None
         urls_raw, created = row
         try:
-            created_dt = _dt.datetime.fromisoformat(created)
-            if (_dt.datetime.now(created_dt.tzinfo) - created_dt).total_seconds() > self._ttl_h * 3600:
+            # 时区防御(V10.18):naive 串按本地时区 aware 化后再与 aware
+            # 当前时刻比较,统一 aware-vs-aware;NULL/畸形 created_at 按
+            # 缓存未命中处理(TypeError 一并兜住,触发刷新重查)。
+            created_dt = _aware_local(_dt.datetime.fromisoformat(created))
+            if (_dt.datetime.now().astimezone() - created_dt).total_seconds() > self._ttl_h * 3600:
                 return None
-        except ValueError:
+        except (TypeError, ValueError):
             return None
         return [u for u in (urls_raw or "").splitlines() if u]
 
@@ -173,7 +194,11 @@ def discover(
                 with telemetry.timer("discovery.search"):
                     found = engine.search(q, max_per)
                 hits = [h.url for h in found]
-            except (DiscoveryConfigError, RuntimeError) as exc:
+            except (DiscoveryConfigError, RuntimeError, OSError) as exc:
+                # OSError 兜底:URLError(DNS 失败/断网)是 OSError 子类,
+                # 引擎层(yandex._http_get)已转中文 RuntimeError,这里再兜住
+                # 任何未转换的原始 OSError(含第三方/自定义引擎)——单查询
+                # 失败只记 errors,绝不击穿整轮 discover。
                 errors.append((q, str(exc)))
                 telemetry.inc("discovery.errors")
                 continue
@@ -210,7 +235,7 @@ def write_leads(urls: list[str], path: str, *, engine_name: str = "") -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
     lines = [LEADS_HEADER]
     if engine_name:
-        lines.append(f"# 引擎:{engine_name} | 生成:{_dt.datetime.now().isoformat(timespec='seconds')}\n")
+        lines.append(f"# 引擎:{engine_name} | 生成:{_dt.datetime.now().astimezone().isoformat(timespec='seconds')}\n")
     lines.extend(u + "\n" for u in urls)
     target.write_text("".join(lines), encoding="utf-8")
     return len(urls)
@@ -224,9 +249,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--keywords-file", help="关键词文件(.txt/.yaml)或以逗号分隔的词表")
     parser.add_argument("--keywords", help="内联关键词,逗号分隔(与 --keywords-file 二选一)")
-    parser.add_argument("--engine", default=None, help="yandex(默认)/ searxng / mock")
+    parser.add_argument("--engine", default=None,
+                        help="yandex(默认,官方 XML API)/ yandex-html(内置网页内核,免凭据)"
+                             " / searxng / mock")
+    parser.add_argument("--transport", default=None, choices=["browser", "http"],
+                        help="yandex-html 专用传输通道:browser(Playwright 渲染,auto 在席即优)"
+                             " / http(纯 urllib);缺省 auto")
     parser.add_argument("--template", action="append", default=None,
                         help="查询模板,可多次给出,支持 {kw} 占位符(默认原样查询)")
+    parser.add_argument("--template-file", default=None,
+                        help="查询模板文件(.txt,每行一模板,{kw} 占位符,# 注释;"
+                             "与 --template 叠加去重;缺省 data/keywords/templates.txt 可自建)")
     parser.add_argument("--out", default="leads.txt", help="线索输出文件(bulk_intake 兼容)")
     parser.add_argument("--config", default=None, help="配置文件路径")
     parser.add_argument("--offline-check", action="store_true",
@@ -238,8 +271,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     if args.engine:
         cfg.discovery_engine = args.engine
+    if args.transport:
+        # 附加属性注入(V10.23):yandex-html 引擎构造时读取,其他引擎忽略。
+        cfg.yandex_html_transport = args.transport
 
-    from netsentinel.discovery.keywords import load_keywords
+    from netsentinel.discovery.keywords import load_keywords, load_templates
 
     try:
         if args.keywords:
@@ -254,14 +290,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误:{exc}")
         return 2
 
+    # V10.20:--template-file 模板文件装载(可选;与 --template 内联模板叠加
+    # 去重,文件模板在前);两者都缺省时 templates 保持 None = 原样查询,
+    # 主线行为零变化。装载在 --offline-check 之前完成,离线检查同样校验模板。
+    templates: list[str] | None = list(args.template or [])
+    if args.template_file:
+        try:
+            file_templates = load_templates(args.template_file)
+        except ValueError as exc:
+            print(f"错误:{exc}")
+            return 2
+        templates = file_templates + [t for t in templates if t not in file_templates]
+    if not templates:
+        templates = None
+
     print(f"关键词 {len(words)} 个;引擎 {cfg.discovery_engine};"
           f"discovery_online={'开' if cfg.discovery_online else '关'}")
+    if templates is not None:
+        print(f"查询模板 {len(templates)} 个(--template-file/--template)")
     if args.offline_check:
         print("离线检查完成:未发出任何查询(线索发现需 discovery_online: true)")
         return 0
 
     try:
-        result = discover(words, cfg, templates=args.template)
+        result = discover(words, cfg, templates=templates)
     except (DiscoveryConfigError, RuntimeError) as exc:
         print(f"错误:{exc}")
         return 1

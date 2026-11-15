@@ -141,7 +141,11 @@ class ModelManager:
                 json.dump(record, fh, ensure_ascii=False, indent=2, sort_keys=True)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp_path, target)
+            # V10.12:状态文件会被 webui/CLI 跨进程读写,Windows 上目标被
+            # 读句柄短暂占用时有限重试(POSIX 行为不变)。
+            from netsentinel.atomic import replace_with_retry  # 惰性:兄弟微工具
+
+            replace_with_retry(tmp_path, target)
         except BaseException:
             try:
                 os.remove(tmp_path)

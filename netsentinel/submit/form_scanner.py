@@ -874,8 +874,13 @@ def generate_draft(
     lines.append(f"name: {_yaml_scalar(name)}")
     lines.append(f"entry_url_key: {_yaml_scalar(entry_url_key)}")
     lines.append(f"category: {_yaml_scalar(category)}")
-    lines.append(f"note: {_yaml_scalar('form_scanner 自动草稿(来源:' + _collapse(source) + ');'
-                 + _DRAFT_BANNER + '。')}")
+    # 先拼字符串再进 f-string:f-string 花括号内换行要 3.12+(PEP 701),
+    # 项目承诺 3.10+,此处必须单行表达式。
+    draft_note = (
+        "form_scanner 自动草稿(来源:" + _collapse(source) + ");"
+        + _DRAFT_BANNER + "。"
+    )
+    lines.append(f"note: {_yaml_scalar(draft_note)}")
     lines.append("selectors:")
     for key in _CONTRACT_KEYS:
         inf = result.fields[key]

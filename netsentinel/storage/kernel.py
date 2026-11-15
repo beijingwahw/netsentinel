@@ -20,6 +20,11 @@ phash / site_memory / batch_state / four_eyes / batch_review ...)。本模块把
 - **既有库兼容**:打开任意既有 sqlite(如 ``review_queue.db``)不建版本表、
   不迁移、不改写任何数据——版本表只在显式调用 ``migrate`` 时创建。
 
+V10.21(席位3)新增公开连接工厂 :func:`connect`:**全仓唯一许可的
+``sqlite3.connect`` 入口**(守门见 ``tests/test_sqlite_factory.py`` 的
+AST 反向扫描),统一 WAL + busy_timeout(:memory: 跳过 WAL 保持原语义;
+``readonly=True`` 走 ``file:...?mode=ro`` URI 只读连接)。
+
 观测:``counters`` 字典(``statements`` / ``ddl_executed`` / ``vacuums``)
 提供确定性的操作计数(基准与自检都用它,绝不依赖墙钟,红线 31);迁移与
 VACUUM 接入 ``netsentinel.telemetry`` 计数。
@@ -36,7 +41,6 @@ VACUUM 接入 ``netsentinel.telemetry`` 计数。
 """
 from __future__ import annotations
 
-import datetime as _dt
 import logging
 import re
 import sqlite3
@@ -45,9 +49,9 @@ import threading
 from pathlib import Path
 from typing import Any, Sequence
 
-from netsentinel import telemetry
+from netsentinel import telemetry, timesource
 
-__all__ = ["BUSY_TIMEOUT_MS", "Repo", "SQLiteKernel", "kernel_selfcheck"]
+__all__ = ["BUSY_TIMEOUT_MS", "Repo", "SQLiteKernel", "connect", "kernel_selfcheck"]
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +80,60 @@ _WRITE_VERSION_SQL = (
 )
 
 
-def _now_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
+    """全仓唯一许可的 ``sqlite3.connect`` 入口(V10.21 席位3 · 连接工厂)。
+
+    把散落在 decision / intel / submit / sessionstore / vision / discovery
+    等处的"裸 ``sqlite3.connect`` + 各自 PRAGMA"惯例收敛成单一出口
+    (守门:``tests/test_sqlite_factory.py`` 反向扫描全仓,新裸连即红):
+
+    - 读写连接(缺省):``PRAGMA busy_timeout=BUSY_TIMEOUT_MS`` +
+      ``PRAGMA journal_mode=WAL``,并以 ``check_same_thread=False`` 建立
+      (跨线程串行化由调用方自己的锁承担,全仓惯例)——与 kernel /
+      review_queue / graph 等模块的既有连接策略逐字节同口径;
+    - ``":memory:"``:**跳过 WAL**(内存库本就不支持 WAL,原语义不变),
+      仅设 busy_timeout;
+    - ``readonly=True``:以 ``file:...?mode=ro`` URI 建立只读连接(路径经
+      ``Path.resolve().as_uri()`` 规范转义),**只设 busy_timeout、不改日志
+      模式**(journal_mode 属写操作,只读连接对非 WAL 库设置必然失败;
+      WAL 库的只读连接天然按 WAL 读)。文件不存在时 sqlite 直接抛
+      ``OperationalError``(unable to open database file),**不会**像读写
+      连接那样误建空库文件——只读消费方的期望行为。
+
+    本函数不建目录、不做任何 DDL(建目录职责在调用方;DDL 是各存储模块
+    自己的 schema)。时间戳一律经 :mod:`netsentinel.timesource`(now_iso)。
+
+    :param path: 库文件路径(str / Path;":memory:" 字面量走内存库分支)。
+    :param readonly: True = 只读 URI 连接(禁止写库,写操作抛
+        ``sqlite3.OperationalError``);缺省 False。
+    :return: 已应用统一 PRAGMA 的 ``sqlite3.Connection``(生命周期归调用方)。
+    :raises ValueError: ``":memory:"`` 与 ``readonly=True`` 同时给出
+        (内存库无文件可指,只读语义不成立)。
+    """
+    db_path = str(path)
+    if readonly:
+        if db_path == ":memory:":
+            raise ValueError(":memory: 不支持 readonly=True(内存库无文件可只读)")
+        uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        return conn
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    # 连接策略与全仓一致(review_queue / vlm_cache / graph 等):
+    # WAL 允许读写并发;忙等 5s 让跨进程锁冲突等待而非立刻失败;
+    # :memory: 跳过 WAL(sqlite 不支持内存库 WAL,保持原语义)。
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    if db_path != ":memory:":
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            # WAL 失败如实上抛(含"文件不是 sqlite 库"的损坏检测——
+            # 调用方 graph / phash / site_memory 等的损坏重建分支依赖它);
+            # 但先关连接,句柄不泄漏:Windows 下重建路径要删库文件,
+            # 残留句柄会让 unlink 失败。
+            conn.close()
+            raise
+    return conn
 
 
 def _check_identifier(name: Any, what: str) -> str:
@@ -122,12 +178,8 @@ class SQLiteKernel:
             parent = Path(self.db_path).parent
             if str(parent):
                 parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        # 连接策略与全仓一致(review_queue / vlm_cache / graph 等):
-        # WAL 允许读写并发;忙等 5s 让跨进程锁冲突等待而非立刻失败。
-        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.commit()
+        # V10.21:连接统一经公开工厂 connect(全仓唯一 sqlite3.connect 入口)。
+        self._conn = connect(self.db_path)
         logger.debug("存储内核已就绪:%s", self.db_path)
 
     # ------------------------------------------------------------------
@@ -235,7 +287,7 @@ class SQLiteKernel:
                 for sql in statements:
                     self._exec(sql)
                     self.counters["ddl_executed"] += 1
-                self._exec(_WRITE_VERSION_SQL, (version, _now_iso()))
+                self._exec(_WRITE_VERSION_SQL, (version, timesource.now_iso()))
                 self._conn.commit()
             except BaseException:
                 if began:

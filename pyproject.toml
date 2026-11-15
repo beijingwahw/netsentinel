@@ -17,6 +17,12 @@ ui = ["streamlit>=1.30"]
 api = ["fastapi>=0.110", "uvicorn>=0.29"]
 fast = ["numpy>=1.26"]
 analytics = ["pyarrow>=15"]
+# system(可选,均为惰性导入、缺失不阻断):
+#   psutil  —— netsentinel/ops/cpu_profile.py 惰性探测(CPU 占用采样,
+#              高负载时三档并发自动降一级;缺失则按"无系统占用"容错);
+#   keyring —— netsentinel/security/keys.py 惰性读取 OS 密钥库(读取顺序
+#              cfg > 环境变量 > keyring > 密钥文件;缺失则跳过该层)。
+system = ["psutil>=5.9", "keyring>=24"]
 dev = ["pytest>=7.0", "httpx>=0.27", "hypothesis>=6.100", "importlinter>=2.0"]
 
 [project.scripts]
@@ -62,10 +68,12 @@ layers = [
     "netsentinel.agent",    # 结案代理(被 submit 编排,自身只依赖 contracts)
     "netsentinel.config",   # 配置装载
     "netsentinel.mathx",    # 数值微库(零内部依赖)
+    "netsentinel.timesource",# 时间源单源(零内部依赖,V10.21 建;被 telemetry/notify/vision/storage 等取时)
     "netsentinel.contracts",# 契约基座(被 88 处 import,最底层叶子)
 ]
 
-# 契约基座零内部依赖:contracts.py 现状零内部 import,必须保持叶子地位。
+# 契约基座零内部依赖:contracts.py 现状零内部 import,必须保持叶子地位
+# (含 timesource:冻结文件,取时惯用式豁免并由 timesource 等价承载)。
 [[tool.importlinter.contracts]]
 name = "contracts 基座零内部依赖"
 type = "forbidden"
@@ -98,6 +106,7 @@ forbidden_modules = [
     "netsentinel.telemetry",
     "netsentinel.telemetry_export",
     "netsentinel.telemetry_trace",
+    "netsentinel.timesource",
     "netsentinel.vision",
 ]
 
@@ -121,6 +130,47 @@ forbidden_modules = [
     "netsentinel.golive",
     "netsentinel.intel",
     "netsentinel.logging_util",
+    "netsentinel.modelmgr",
+    "netsentinel.notify",
+    "netsentinel.ops",
+    "netsentinel.pipeline",
+    "netsentinel.policy",
+    "netsentinel.report",
+    "netsentinel.security",
+    "netsentinel.service",
+    "netsentinel.setup",
+    "netsentinel.storage",
+    "netsentinel.submit",
+    "netsentinel.telemetry",
+    "netsentinel.telemetry_export",
+    "netsentinel.telemetry_trace",
+    "netsentinel.timesource",
+    "netsentinel.vision",
+]
+
+# 时间源零内部依赖(与 contracts/mathx 同层的基座叶子;V10.21 建、
+# V10.24 席位3 补声明):timesource 只许依赖 stdlib datetime,是全库
+# 取时单源——任何内部模块都可依赖它,它永不反向依赖业务模块
+# (守门双保险:tests/test_timesource.py 的 AST 零内部依赖断言)。
+[[tool.importlinter.contracts]]
+name = "timesource 时间源零内部依赖"
+type = "forbidden"
+source_modules = ["netsentinel.timesource"]
+forbidden_modules = [
+    "netsentinel.agent",
+    "netsentinel.batchflow",
+    "netsentinel.cli",
+    "netsentinel.config",
+    "netsentinel.contracts",
+    "netsentinel.crawler",
+    "netsentinel.decision",
+    "netsentinel.discovery",
+    "netsentinel.evidence",
+    "netsentinel.finishflow",
+    "netsentinel.golive",
+    "netsentinel.intel",
+    "netsentinel.logging_util",
+    "netsentinel.mathx",
     "netsentinel.modelmgr",
     "netsentinel.notify",
     "netsentinel.ops",

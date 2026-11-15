@@ -47,12 +47,16 @@ _REGISTRY_LOCK = threading.RLock()
 # guard(A217):本地守卫模型适配器(ShieldGemma-2 / Llama Guard 类),导入时
 # 自注册 "guard";模型路径经 ``cfg.guard_model_path`` 注入(附加属性,
 # getattr 动态读取),缺席时由适配器构造期抛中文 ValueError(缺省错误语义)。
+# failover(V10.21 收口):故障转移链分类器,导入时自注册 "failover",链取自
+# ``cfg.vlm_fallback_chain``;此前注册链完整但惰性表缺席,配置直达会被
+# warning 跳过(V10.21 席位4 实测,详见 docs/MULTI_PROVIDER.md §5.2)。
 _LAZY_IMPORT_MODULES: dict[str, str] = {
     "stub": "netsentinel.vision.stub_classifier",
     "nudenet": "netsentinel.vision.nudenet_adapter",
     "clip": "netsentinel.vision.hf_clip_adapter",
     "glm": "netsentinel.vision.glm_adapter",
     "guard": "netsentinel.vision.guard_adapter",
+    "failover": "netsentinel.vision.failover",
 }
 
 # 惰性导入失败记忆(V5):导入抛过 ImportError 的模块路径只尝试一次,
@@ -69,9 +73,15 @@ class NsfwClassifier(ABC):
       1. 必须定义非空类属性 ``name``(与注册表键一致,如 "stub"/"nudenet"/"clip");
       2. 必须实现 ``classify``;
       3. 构造函数应接受 ``cfg: Config``——工厂以 ``cls(cfg)`` 实例化。
+
+    P1-5(V10.30)计费标记:子类可声明 ``consumes_vlm_budget = True`` 表示
+    其评分路径消耗 VlmCache 日预算(远程 VLM 家族:vlm/glm/cascade/failover);
+    本地内核(stub/nudenet/clip/guard)保持缺省 False。扫描预检据此判断
+    是否需要预算闸门——纯本地扫描零打扰。
     """
 
     name: str = ""
+    consumes_vlm_budget: bool = False
 
     @abstractmethod
     def classify(self, img: ImageEvidence) -> ImageScore:

@@ -32,13 +32,24 @@ logger = logging.getLogger(__name__)
 #: 官方 XML 端点(可经子类/测试替换)
 YANDEX_XML_ENDPOINT = "https://yandex.com/search/xml"
 
+#: 对外声明的 User-Agent。与 crawler.fetcher.USER_AGENT、
+#: crawler.redirect._FALLBACK_USER_AGENT 为同一取值的三处副本(发现层与
+#: 采集层互不 import,保持包间零依赖;修改任何一处须同步其余两处)。
+USER_AGENT = "NetSentinel/0.17"
+
 
 def _http_get(url: str, timeout: float) -> tuple[int, str]:
-    """GET 并返回 (status, body);HTTPError 转 (code, body) 不抛,URLError 上抛。"""
+    """GET 并返回 (status, body);HTTPError 转 (code, body) 不抛。
+
+    URLError(DNS 解析失败 / 断网 / 连接被拒等连接层错误)转中文
+    RuntimeError 上抛(searxng 复用本函数,同享该语义),由发现流水线
+    按"单查询失败"优雅记账——绝不以 OSError 子类的原始形态击穿整轮
+    discover。
+    """
     import urllib.error
     import urllib.request
 
-    req = urllib.request.Request(url, headers={"User-Agent": "NetSentinel/0.6"})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return int(getattr(resp, "status", 200) or 200), resp.read().decode(
@@ -46,6 +57,10 @@ def _http_get(url: str, timeout: float) -> tuple[int, str]:
             )
     except urllib.error.HTTPError as exc:
         return int(exc.code), exc.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"搜索外呼连接失败(DNS 解析失败/断网/超时):{getattr(exc, 'reason', exc)}"
+        ) from exc
 
 
 class YandexXmlEngine(SearchEngine):

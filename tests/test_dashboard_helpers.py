@@ -557,3 +557,107 @@ def test_ledger_path_from_cfg_variants():
     assert ledger_path_from_cfg(SimpleNamespace(event_ledger=None)) == ""
     assert ledger_path_from_cfg(SimpleNamespace(event_ledger="   ")) == ""
     assert ledger_path_from_cfg(SimpleNamespace(event_ledger=" a.db ")) == "a.db"
+
+
+# ---------------------------------------------------------------------------
+# V10.18 性能:load_report_dict_cached(mtime 键控 LRU 缓存)等价性
+# ---------------------------------------------------------------------------
+def _make_bundle(tmp_path, name: str, agg: float) -> tuple:
+    """造一个 bundle 目录 + 边车 manifest + 同名空 zip,返回 (zip_path, report)。"""
+    import json as _json
+
+    bundle = tmp_path / name
+    bundle.mkdir()
+    report = {
+        "site_url": f"https://{name}.example.com",
+        "agg_nsw_prob": agg,
+        "needs_review": True,
+        "image_scores": [],
+    }
+    (bundle / "manifest.json").write_text(
+        _json.dumps({"report": report, "files": []}), encoding="utf-8"
+    )
+    (tmp_path / f"{name}.zip").write_bytes(b"PK\x05\x06" + b"\x00" * 18)  # 空 zip
+    return tmp_path / f"{name}.zip", report
+
+
+def test_v10_manifest_cache_same_manifest_same_result_zero_reparse(
+    tmp_path, monkeypatch
+):
+    """等价性之一:同 manifest(键不变)命中返回同一结果,且零回读。"""
+    import webui.app as webui_app
+    from webui.dashboard import (
+        clear_manifest_cache,
+        load_report_dict_cached,
+    )
+
+    zip_path, report = _make_bundle(tmp_path, "site_a", 0.5)
+    clear_manifest_cache()
+
+    first = load_report_dict_cached(str(zip_path))
+    assert first == report  # 未命中:与直调 load_report_dict 值恒等
+    assert first == webui_app.load_report_dict(str(zip_path))
+
+    # 计数原函数调用:命中路径不得再触发任何 zip/manifest 回读
+    calls = {"n": 0}
+    real = webui_app.load_report_dict
+
+    def _counting(p):
+        calls["n"] += 1
+        return real(p)
+
+    monkeypatch.setattr(webui_app, "load_report_dict", _counting)
+    for _ in range(3):  # 多次 rerun 语义:重复命中
+        assert load_report_dict_cached(str(zip_path)) == report
+    assert calls["n"] == 0  # 命中零回读(无 zip 打开/读取/解析)
+
+
+def test_v10_manifest_cache_invalidated_when_manifest_changes(tmp_path):
+    """等价性之二:manifest 变更(mtime 变)后缓存失效,读到新内容。"""
+    import json as _json
+    import os as _os
+
+    from webui.dashboard import clear_manifest_cache, load_report_dict_cached
+
+    bundle = tmp_path / "site_b"
+    bundle.mkdir()
+    manifest = bundle / "manifest.json"
+    zip_path = tmp_path / "site_b.zip"
+    zip_path.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+
+    v1 = {"site_url": "https://b.example.com", "agg_nsw_prob": 0.1}
+    manifest.write_text(_json.dumps({"report": v1}), encoding="utf-8")
+    _os.utime(manifest, (1_000_000, 1_000_000))  # 显式钉住 mtime,规避 FS 粒度
+    clear_manifest_cache()
+    assert load_report_dict_cached(str(zip_path)) == v1
+
+    v2 = {"site_url": "https://b.example.com", "agg_nsw_prob": 0.9}
+    manifest.write_text(_json.dumps({"report": v2}), encoding="utf-8")
+    _os.utime(manifest, (2_000_000, 2_000_000))  # mtime 变化 → 键变 → 失效
+    assert load_report_dict_cached(str(zip_path)) == v2
+
+    # zip 本体重写(边车不变)同样换键:包内 manifest 兜底口径随之刷新
+    zip_path.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    _os.utime(zip_path, (3_000_000, 3_000_000))
+    assert load_report_dict_cached(str(zip_path)) == v2  # 边车优先,值仍 v2
+
+
+def test_v10_manifest_cache_lru_eviction_cap_and_readonly_none(tmp_path):
+    """LRU 上限 256 条:超限淘汰最久未用;None 结果同样可缓存(等价)。"""
+    import webui.dashboard as dashboard
+    from webui.dashboard import MANIFEST_CACHE_LIMIT, load_report_dict_cached
+
+    dashboard.clear_manifest_cache()
+    # 不存在的包:键(全 -1 mtime)→ None 入缓存,反复命中仍 None
+    missing = str(tmp_path / "missing.zip")
+    assert load_report_dict_cached(missing) is None
+    assert load_report_dict_cached(missing) is None
+
+    # 填超上限数量的键:缓存条数不得超过 256
+    for i in range(MANIFEST_CACHE_LIMIT + 40):
+        load_report_dict_cached(str(tmp_path / f"p{i}.zip"))
+    assert len(dashboard._manifest_cache) <= MANIFEST_CACHE_LIMIT
+    # 最早的 missing 键已被 LRU 淘汰:再次访问重新求值(结果仍等价 None)
+    assert load_report_dict_cached(missing) is None
+    dashboard.clear_manifest_cache()
+    assert len(dashboard._manifest_cache) == 0

@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="88" viewBox="0 0 1280 88" role="img" aria-labelledby="title desc" font-family="'Noto Sans CJK SC','Source Han Sans SC','Microsoft YaHei','PingFang SC',Arial,sans-serif">
+  <title id="title">NetSentinel 项目状态条</title>
+  <desc id="desc">展示 Python 版本、当前版本、VLM 提供方数量、人工门、默认离线安全和消费端数量六个状态标签。</desc>
+  <defs>
+    <linearGradient id="stripBg" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f8fafc"/>
+    </linearGradient>
+    <filter id="pillShadow" x="-20%" y="-40%" width="140%" height="180%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.07"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="1264" height="72" rx="22" fill="url(#stripBg)" stroke="#e2e8f0"/>
+  <g filter="url(#pillShadow)" font-size="14" font-weight="700">
+    <g transform="translate(24 18)">
+      <rect width="192" height="52" rx="16" fill="#eff6ff" stroke="#bfdbfe"/>
+      <circle cx="27" cy="26" r="13" fill="#2563eb"/>
+      <text x="27" y="31" text-anchor="middle" fill="#ffffff" font-size="12">Py</text>
+      <text x="50" y="31" fill="#1e3a8a">Python 3.10+</text>
+    </g>
+    <g transform="translate(232 18)">
+      <rect width="192" height="52" rx="16" fill="#ecfdf5" stroke="#a7f3d0"/>
+      <circle cx="27" cy="26" r="13" fill="#0f766e"/>
+      <text x="27" y="31" text-anchor="middle" fill="#ffffff" font-size="12">V</text>
+      <text x="50" y="31" fill="#115e59">V10.38</text>
+    </g>
+    <g transform="translate(440 18)">
+      <rect width="192" height="52" rx="16" fill="#f5f3ff" stroke="#ddd6fe"/>
+      <circle cx="27" cy="26" r="13" fill="#7c3aed"/>
+      <text x="27" y="31" text-anchor="middle" fill="#ffffff" font-size="12">AI</text>
+      <text x="50" y="31" fill="#5b21b6">20 家 VLM</text>
+    </g>
+    <g transform="translate(648 18)">
+      <rect width="192" height="52" rx="16" fill="#fff7ed" stroke="#fed7aa"/>
+      <circle cx="27" cy="26" r="13" fill="#ea580c"/>
+      <text x="27" y="31" text-anchor="middle" fill="#ffffff" font-size="13">✓</text>
+      <text x="50" y="31" fill="#9a3412">HUMAN GATE</text>
+    </g>
+    <g transform="translate(856 18)">
+      <rect width="192" height="52" rx="16" fill="#f0fdfa" stroke="#99f6e4"/>
+      <circle cx="27" cy="26" r="13" fill="#0d9488"/>
+      <text x="27" y="31" text-anchor="middle" fill="#ffffff" font-size="13">●</text>
+      <text x="50" y="31" fill="#134e4a">默认零外呼</text>
+    </g>
+    <g transform="translate(1064 18)">
+      <rect width="192" height="52" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+      <circle cx="27" cy="26" r="13" fill="#475569"/>
+      <text x="27" y="31" text-anchor="middle" fill="#ffffff" font-size="12">5</text>
+      <text x="50" y="31" fill="#334155">5 种消费端</text>
+    </g>
+  </g>
+</svg>

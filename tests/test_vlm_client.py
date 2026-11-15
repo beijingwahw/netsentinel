@@ -11,6 +11,7 @@ A243 成本旁路落账(默认关):开关矩阵——缺省关零落账 / 附加
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import pathlib
@@ -1125,3 +1126,97 @@ def test_a243_client_marks_self_ledgering() -> None:
 def test_a243_usage_tokens_extraction(style: str, body: str, want) -> None:
     """token 用量提取:三方言 usage 字段口径;任何缺失/类型不对 → None(诚实)。"""
     assert vlm_client._usage_tokens_from_body(body, style) == want
+
+
+# ---------------------------------------------------------------------------
+# V10.18:HTTP 响应体大小上限(robustness,防异常超大响应占内存)
+# ---------------------------------------------------------------------------
+
+
+class _ChunkedFakeResponse:
+    """urlopen 响应鸭子:按预置字节块回放,read(n) 语义与 http.client 一致。"""
+
+    def __init__(self, chunks: list[bytes], status: int = 200) -> None:
+        self._chunks = list(chunks)
+        self.status = status
+
+    def read(self, n: int = -1) -> bytes:
+        if not self._chunks:
+            return b""
+        first = self._chunks[0]
+        if n is None or n < 0 or len(first) <= n:
+            return self._chunks.pop(0)
+        self._chunks[0] = first[n:]
+        return first[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_v10_read_capped_equivalent_for_small_bodies() -> None:
+    """上限内的响应:分块读与整读逐字节等价(含跨块的 UTF-8 多字节字符)。"""
+    text = '{"k": "你好,世界"}'
+    raw = text.encode("utf-8")
+    # 把多字节字符从中间劈开,验证先 join 再解码不受分块边界影响
+    stream = _ChunkedFakeResponse([raw[:3], raw[3:7], raw[7:]])
+    body, exceeded = vlm_client._read_capped(stream)
+    assert body == text
+    assert exceeded is False
+
+
+def test_v10_http_post_json_small_body_unchanged(monkeypatch) -> None:
+    """上限内的成功响应经 _http_post_json 返回值与整读完全一致。"""
+    payload = json.dumps({"choices": [{"message": {"content": '{"a": 1}'}}]})
+    resp = _ChunkedFakeResponse([payload.encode("utf-8")[:10], payload.encode("utf-8")[10:]])
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        return resp
+
+    monkeypatch.setattr(vlm_client.urllib.request, "urlopen", fake_urlopen)
+    status, body = vlm_client._http_post_json(
+        "https://api.example.com/v1/chat/completions", {}, {"m": 1}, 12.5
+    )
+    assert status == 200
+    assert body == payload
+
+
+def test_v10_http_post_json_rejects_oversized_success_body(monkeypatch) -> None:
+    """成功响应超过 RESPONSE_MAX_MB:中止读取并抛中文 RuntimeError(不含响应内容)。"""
+    monkeypatch.setattr(vlm_client, "RESPONSE_MAX_MB", 0.001)  # ≈1KB,零大内存
+    total = int(0.001 * 1024 * 1024) + 4096
+    stream = _ChunkedFakeResponse([b"x" * total])
+    monkeypatch.setattr(
+        vlm_client.urllib.request, "urlopen", lambda request, timeout=None: stream
+    )
+    with pytest.raises(RuntimeError, match="超过大小上限"):
+        vlm_client._http_post_json(
+            "https://api.example.com/v1/chat/completions", {}, {"m": 1}, 12.5
+        )
+
+
+def test_v10_http_post_json_truncates_oversized_error_body(monkeypatch) -> None:
+    """HTTPError 错误体超限:截断到上限、不抛出,状态码语义保持。"""
+    monkeypatch.setattr(vlm_client, "RESPONSE_MAX_MB", 0.001)  # ≈1KB
+    total = int(0.001 * 1024 * 1024) + 4096
+    err = urllib.error.HTTPError(
+        "https://api.example.com/v1/chat/completions",
+        502,
+        "Bad Gateway",
+        None,
+        io.BytesIO(b"e" * total),
+    )
+
+    def fake_urlopen(request, timeout=None):
+        raise err
+
+    monkeypatch.setattr(vlm_client.urllib.request, "urlopen", fake_urlopen)
+    status, body = vlm_client._http_post_json(
+        "https://api.example.com/v1/chat/completions", {}, {"m": 1}, 12.5
+    )
+    assert status == 502
+    assert 0 < len(body) <= int(0.001 * 1024 * 1024)  # 截断使用,不上抛

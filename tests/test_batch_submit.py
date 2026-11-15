@@ -695,3 +695,71 @@ def test_default_rate_limiter_uses_stricter_interval(
     assert created[0]["path"] == tmp_path / "data" / "rate_limit.json"
     assert created[0]["min"] == 120  # max(90, 120):批量频控不得放宽
     assert created[0]["max"] == 3
+
+
+def test_trace_spans_present_when_enabled(tmp_path: pathlib.Path) -> None:
+    """cfg.trace_enabled 开启:提交链路开出 submit.rate_limit / submit.plan /
+    submit.execute span(逐条一份);默认关闭时零 span(行为不变,V10.18)。"""
+    import netsentinel.telemetry_trace as tt
+
+    # 开启:两条条目全部提交成功 → 每条各开 rate_limit / plan / execute 三个 span
+    cfg = make_cfg(tmp_path, trace_enabled=True)
+    deps = make_deps()  # FakeExecutor 缺省 outcome = "submitted"
+    seen_trace_ids: list[str | None] = []
+
+    class TraceProbeExecutor:
+        """执行器替身:透传 FakeExecutor 并顺手记录当前 trace_id。"""
+
+        def __init__(self) -> None:
+            self._inner = deps["executor"]
+
+        def __call__(self, plan: Any, cfg: Config, **kwargs: Any) -> Any:
+            seen_trace_ids.append(tt.current_trace_id())
+            return self._inner(plan, cfg, **kwargs)
+
+    try:
+        tt.reset()
+        summary = run_batch(
+            make_items(2), cfg, **kw(deps, executor=TraceProbeExecutor())
+        )
+        assert summary["submitted"] == 2
+        # 两条条目在同一条 trace 内(一链一 trace)
+        trace_ids = {tid for tid in seen_trace_ids if tid is not None}
+        assert len(trace_ids) == 1, f"期望单条 trace,实际:{trace_ids}"
+        tree = tt.export_trace_json(trace_ids.pop())
+
+        def _names(node: dict) -> list[str]:
+            out = [node["name"]]
+            for child in node["children"]:
+                out.extend(_names(child))
+            return out
+
+        names = [n for root in tree["spans"] for n in _names(root)]
+        assert names.count("submit.rate_limit") == 2
+        assert names.count("submit.plan") == 2
+        assert names.count("submit.execute") == 2
+    finally:
+        tt.reset()
+
+    # 默认关闭:零 span、零 trace(执行器视角 current_trace_id 恒 None)
+    cfg_off = make_cfg(tmp_path)
+    deps_off = make_deps()
+    seen_off: list[str | None] = []
+
+    class ProbeOff:
+        def __init__(self) -> None:
+            self._inner = deps_off["executor"]
+
+        def __call__(self, plan: Any, cfg: Config, **kwargs: Any) -> Any:
+            seen_off.append(tt.current_trace_id())
+            return self._inner(plan, cfg, **kwargs)
+
+    try:
+        tt.reset()
+        summary = run_batch(
+            make_items(2), cfg_off, **kw(deps_off, executor=ProbeOff())
+        )
+        assert summary["submitted"] == 2
+        assert seen_off == [None, None]  # 未开任何 trace / span
+    finally:
+        tt.reset()

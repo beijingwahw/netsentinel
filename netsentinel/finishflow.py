@@ -67,7 +67,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import datetime as _dt
 import importlib
 import json
 import logging
@@ -75,9 +74,10 @@ import pathlib
 import re
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.parse import urlsplit
 
 from netsentinel import telemetry
+from netsentinel import timesource
+from netsentinel import _flowutil
 from netsentinel.contracts import Config
 
 __all__ = ["PORTAL_DEFAULT", "finish", "main", "run_report"]
@@ -125,6 +125,11 @@ _OUTCOME_KEYS: tuple[str, ...] = (
 
 # ---------------------------------------------------------------------------
 # 惰性导入辅助(兄弟模块并行开发中,未就位抛中文 RuntimeError)
+#
+# 交叉注释(设计说明):本函数在 __main__ / batchflow / finishflow /
+# sessionflow 四处各有一份逐字重复——**入口独立性是设计**(每个 CLI 入口
+# 零兄弟依赖、可单独运行),不做收敛;两 flow 共用的纯辅助已提取到
+# netsentinel/_flowutil.py(其内部持有自己的私有惰性导入,不经本函数)。
 # ---------------------------------------------------------------------------
 def _load(module_name: str, attr: str) -> Any:
     """惰性导入 ``module_name.attr``;ImportError/缺属性 → 中文 RuntimeError。"""
@@ -189,95 +194,11 @@ def _pool_runner_with_workers(
     return _wrapped
 
 
-def _as_mapping(row: Any) -> dict[str, Any]:
-    """把续批行(A113 resume 返回的 dict/sqlite Row/对象)宽容转成 dict。"""
-    if isinstance(row, Mapping):
-        return dict(row)
-    keys = getattr(row, "keys", None)
-    if callable(keys):
-        try:
-            return {str(k): row[k] for k in keys()}
-        except Exception:  # noqa: BLE001 - 鸭子行取值失败按空映射处理
-            return {}
-    state = getattr(row, "__dict__", None)
-    return dict(state) if isinstance(state, dict) else {}
-
-
-def _merge_resumed_items(
-    rows: list[Any], ready_items: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """续批行 ←→ 就绪清单按 ``entry_id`` 合并补齐执行细节。
-
-    - 就绪条目按 ``entry_id`` 建索引;续批行优先保留自身字段,就绪条目
-      补齐/覆盖非空的 ``portal`` / ``site_url`` / ``evidence_zip`` 等;
-    - ``portal`` 双缺时补 :data:`PORTAL_DEFAULT`(A112 run_batch 前置)。
-    """
-    ready_by_id: dict[Any, dict[str, Any]] = {}
-    for item in ready_items:
-        eid = item.get("entry_id")
-        if eid is not None:
-            ready_by_id[eid] = dict(item)
-    merged: list[dict[str, Any]] = []
-    for row in rows:
-        item = _as_mapping(row)
-        base = ready_by_id.get(item.get("entry_id"), {})
-        for key, value in base.items():
-            if value not in (None, ""):
-                item[key] = value
-        if not item.get("portal"):
-            item["portal"] = PORTAL_DEFAULT
-        merged.append(item)
-    return merged
-
-
 # ---------------------------------------------------------------------------
 # ③.5 trace 树落盘(V12 接线收口):intel["trace_id"] → data/runs/<站点>/trace.json
+#    trace_id_of / site_dirname 已收敛至 netsentinel/_flowutil.py
+#    (与 batchflow 共用同一实现,行为不变)。
 # ---------------------------------------------------------------------------
-def _trace_id_of(report: Any) -> str:
-    """鸭子取 ``report.intel["trace_id"]``;无 intel / 非映射 / 无键 → 空串。
-
-    trace_id 是 16-hex 非内容字段(A198 契约),不涉站点内容,可安全计数。
-    """
-    intel = getattr(report, "intel", None)
-    if isinstance(intel, Mapping):
-        tid = intel.get("trace_id")
-        if isinstance(tid, str) and tid:
-            return tid
-    return ""
-
-
-def _site_dirname(url: str, report: Any) -> str:
-    """站点目录名:canonical 键优先,回退主机名,再退安全化整串(纯本地、确定)。
-
-    - 优先 ``intel.canonical.canonical_key``(项目既定站点同一性口径,
-      ``www.`` 归并/IP 直连原样),模块缺席时降级 ``urlsplit().hostname``;
-    - 任何来源都经 ``[^0-9A-Za-z._-]`` 安全化(IPv6 冒号等目录非法字符
-      归一为 ``_``),保证跨平台可作目录名;全部解析失败回退 ``"site"``。
-    """
-    candidates = [str(url or ""), str(getattr(report, "site_url", "") or "")]
-    try:
-        canonical_key = _load("netsentinel.intel.canonical", "canonical_key")
-    except RuntimeError:
-        canonical_key = None
-    if canonical_key is not None:
-        for candidate in candidates:
-            key = str(canonical_key(candidate) or "")
-            if key:
-                return re.sub(r"[^0-9A-Za-z._-]+", "_", key)
-    for candidate in candidates:
-        try:
-            host = (urlsplit(candidate).hostname or "").strip().lower()
-        except ValueError:
-            host = ""
-        if host:
-            return re.sub(r"[^0-9A-Za-z._-]+", "_", host)
-    for candidate in candidates:
-        slug = re.sub(r"[^0-9A-Za-z._-]+", "_", candidate).strip("._-")
-        if slug:
-            return slug[:64]
-    return "site"
-
-
 def _export_scan_traces(reports: Mapping[str, Any], cfg: Config) -> list[str]:
     """把扫描结果携带的 ``intel["trace_id"]`` 逐站点导出为 span 树 JSON。
 
@@ -298,7 +219,7 @@ def _export_scan_traces(reports: Mapping[str, Any], cfg: Config) -> list[str]:
     """
     pending: list[tuple[str, Any, str]] = []
     for url, report in dict(reports or {}).items():
-        tid = _trace_id_of(report)
+        tid = _flowutil.trace_id_of(report)
         if tid:
             pending.append((str(url), report, tid))
     if not pending:
@@ -317,7 +238,7 @@ def _export_scan_traces(reports: Mapping[str, Any], cfg: Config) -> list[str]:
     data_dir = pathlib.Path(str(getattr(cfg, "data_dir", "data") or "data"))
     written: list[str] = []
     for url, report, tid in pending:
-        out_path = data_dir / "runs" / _site_dirname(url, report) / "trace.json"
+        out_path = data_dir / "runs" / _flowutil.site_dirname(url, report) / "trace.json"
         try:
             tree = export_trace_json(tid)
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,11 +263,11 @@ def _export_scan_traces(reports: Mapping[str, Any], cfg: Config) -> list[str]:
 # ---------------------------------------------------------------------------
 def _default_run_id() -> str:
     """缺省批次标识:本地时间 ``run-YYYYMMDD-HHMMSS``(纯本地、可排序)。"""
-    return "run-" + _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return "run-" + timesource.now_local().strftime("%Y%m%d-%H%M%S")
 
 
 def _safe_run_dirname(run_id: str) -> str:
-    """批次标识 → 安全目录名(与 :func:`_site_dirname` 同一安全化口径)。"""
+    """批次标识 → 安全目录名(与 :func:`_flowutil.site_dirname` 同一安全化口径)。"""
     slug = re.sub(r"[^0-9A-Za-z._-]+", "_", str(run_id or "")).strip("._-")
     return slug[:64] if slug else "run"
 
@@ -424,9 +345,7 @@ def _close_out_cost(cfg: Config, run_id: str) -> dict[str, Any] | None:
             {
                 "kind": "meta",
                 "run_id": run_id,
-                "generated_at": _dt.datetime.now().astimezone().isoformat(
-                    timespec="seconds"
-                ),
+                "generated_at": timesource.now_iso(),
                 "ledger": _COST_LEDGER_NAME,
                 "records": int(by_run["totals"]["calls"]),
             }
@@ -685,21 +604,23 @@ def finish(
     trace_json_paths = _export_scan_traces(reports, cfg)
 
     # ④ 结案汇总 + 举报准备(A168;零提交路径——红线 36)
-    if summary is not None:
-        summary_run = getattr(summary, "run", None)
-        if callable(summary_run):
-            outcome_raw = summary_run(scan_result, cfg)
-        elif callable(summary):
-            outcome_raw = summary(scan_result, cfg)
-        else:
-            raise RuntimeError(
-                "注入的结案汇总器既不可调用也未提供 run(scan_result, cfg) 方法:"
-                f"{type(summary).__name__}"
-            )
-    else:
-        summary_cls = _load("netsentinel.agent.summary_agent", "SummaryAgent")
-        outcome_raw = summary_cls().run(scan_result, cfg)
+    # 计时器须包住 SummaryAgent.run() 真正耗时的调用与注入分支(此前只包住
+    # _outcome_dict 的纯转换,summary 指标近乎恒为 0——计时错位修复)。
     with telemetry.timer(_METRIC_FINISH_SUMMARY):
+        if summary is not None:
+            summary_run = getattr(summary, "run", None)
+            if callable(summary_run):
+                outcome_raw = summary_run(scan_result, cfg)
+            elif callable(summary):
+                outcome_raw = summary(scan_result, cfg)
+            else:
+                raise RuntimeError(
+                    "注入的结案汇总器既不可调用也未提供 run(scan_result, cfg) 方法:"
+                    f"{type(summary).__name__}"
+                )
+        else:
+            summary_cls = _load("netsentinel.agent.summary_agent", "SummaryAgent")
+            outcome_raw = summary_cls().run(scan_result, cfg)
         outcome = _outcome_dict(outcome_raw)
 
     result: dict[str, Any] = dict(outcome)
@@ -863,7 +784,9 @@ def run_report(
             unfinished = list(st.resume(batch_id) or [])
             ready_n = len(ready_items)
             if unfinished:
-                ready_items = _merge_resumed_items(unfinished, ready_items)
+                ready_items = _flowutil.merge_resumed_items(
+                    unfinished, ready_items, portal_default=PORTAL_DEFAULT
+                )
                 telemetry.inc(_METRIC_REPORT_CONTINUE)
                 print(
                     f"续批批次 {batch_id}:未完条目 {len(unfinished)} 条"

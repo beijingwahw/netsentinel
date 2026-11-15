@@ -214,7 +214,9 @@ def fuse(
                 products[k] = wk * scale * x[k]
             weights_used = {k: round(v * scale, 4) for k, v in w.items()}
             contrib = {k: round(products[k], 4) for k in products}
-            z = BIAS + sum(products.values())
+            # math.fsum:加权项正确舍入求和——边界用例(Σw·x 恰等于复核线)
+            # 在不同平台 libm / 求和顺序下逐位确定,不受 Python 版本影响。
+            z = BIAS + math.fsum(products.values())
             fused = _sigmoid(z)
             note = ""
 

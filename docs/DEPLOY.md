@@ -17,6 +17,7 @@
 | transformers + torch + Pillow | clip extra | `python -m pip install -e ".[clip]"` | `clip` 分类器不可用;page_vlm 大截图不压缩 |
 | Streamlit | ≥1.30 | `python -m pip install -e ".[ui]"` | webui 复核台不可用(CLI 队列操作不受影响) |
 | FastAPI + uvicorn | ≥0.110 / ≥0.29 | `python -m pip install -e ".[api]"` | REST 服务不可用 |
+| psutil + keyring(system) | ≥5.9 / ≥24 | `python -m pip install -e ".[system]"` | 可选:无 psutil 时 CPU 占用采样降档不生效(按无占用容错);无 keyring 时密钥环层跳过(仍可用环境变量/密钥文件) |
 | pytest | ≥7.0(dev) | `python -m pip install -e ".[dev]"` | 无法跑测试 |
 
 一条常用全家桶:
@@ -32,7 +33,7 @@ python -m playwright install chromium
 
 ## 2. 目录与数据规划
 
-安装布局建议(以 Linux `/opt/netsentinel` 为例,Windows 对应 `C:\1\netsentinel`):
+安装布局建议(以 Linux `/opt/netsentinel` 为例,Windows 对应 `D:\3\netsentinel`):
 
 ```
 <netsentinel 根>/
@@ -78,7 +79,7 @@ icacls "%USERPROFILE%\.netsentinel\glm_key" /inheritance:r /grant:r "%USERNAME%:
 
 ---
 
-## 4. 四种运行形态
+## 4. 运行形态
 
 | 形态 | 启动 | 适用 |
 | --- | --- | --- |
@@ -86,12 +87,14 @@ icacls "%USERPROFILE%\.netsentinel\glm_key" /inheritance:r /grant:r "%USERNAME%:
 | **定期巡查(scheduler)** | `python -m netsentinel.ops.scheduler --loop --interval-min 360`(或 `--once` 跑一轮) | 维护 watchlist 清单,自动周期巡查 + 站点记忆去重 + 待复核通知 |
 | **Streamlit 复核台** | `streamlit run webui/app.py`(浏览器打开,仅本机) | 人工批量复核:看证据、看 intel 解释、批准 / 驳回、预览举报计划 |
 | **REST 服务** | `python -m service.app`(默认 `127.0.0.1:8765`,无鉴权,仅本机) | 与自有工具集成;端点见 [API.md](API.md) |
+| **连接向导(按需临时)** | `python -m netsentinel.modelmgr serve`(缺省 `cfg.setup_port`=**8766**;或 REST 无模型时自动弹出) | 首次安装 / 无视觉模型时的引导:扫描本机服务、本地模型一键启用、云平台 20 家下拉 + 密钥(password 只进不显,落盘仅密钥环)、测试连接、离线桩兜底 |
 
 说明:
 
 - **scheduler(A39)**:读 `watchlist_path`(默认 `watchlist.yaml`,从 `watchlist.example.yaml` 复制;条目为 `url / note / enabled`);每项先问 `SiteMemory`(站点指纹 = 页面 URL 集 + 图片 sha256 集的哈希,默认 72 小时 TTL)是否需要重扫,未变化的跳过;扫描出 `needs_review` 的站点通过 `notify_webhook` 推提醒(钉钉 / 飞书 / 企微 / 通用 JSON);逐项之间带 `间隔基数 + 随机抖动` 的 sleep,避免密集访问。每轮返回 `{"scanned", "skipped", "failed", "notified"}` 摘要。
-- **复核台与 REST 服务都没有鉴权**:保持本机回环访问;`webui` 可用环境变量 `NETSENTINEL_DATA_DIR` 指向数据目录(见 `webui/README.md`)。
-- 四种形态共用同一份 `config.yaml` 与 `data/`,可并存(注意 sqlite 并发写入是短锁,常规规模无碍)。
+- **复核台与 REST 服务都没有鉴权**:保持本机回环访问;环境变量 `NETSENTINEL_DATA_DIR` 可把数据目录指向任意路径,**V10.21 起全局生效**(CLI / REST / webui 统一在 `load_config` 认该变量;优先级 env > `config.yaml` > 默认 `./data`;空串/纯空白视为未设置)。设置后按默认布局整体迁移:`<root>/{evidence, review_queue.db, audit.jsonl, logs/netsentinel.log, vlm_cache.db}`,且 `data_dir` 本身置为 `<root>`,凡持 cfg 派生路径的消费方(sessionstore / batchflow / finishflow / agent 汇总 / vlm 缓存等)自动跟随;`phash_db` / `graph_db` / `discovery_cache_db` 不随迁(与 webui 历史口径一致,需要迁移时在 `config.yaml` 显式指定)。
+- **连接向导端口 8766 与 REST 端口 8765 是两个独立端口**:向导为纯标准库自托管单页(零依赖),守护单例(锁文件+探活),端口被占时自动依次尝试 `setup_port+1 .. +5`(全部被占则中文报错退出);密钥输入为 password 语义,回显/日志一律掩码,落盘仅经 `security.keys`(红线 33);完成配置后可关停,不影响其他形态。详见 [SETUP_GUIDE.md](SETUP_GUIDE.md)。
+- 各形态共用同一份 `config.yaml` 与 `data/`,可并存(注意 sqlite 并发写入是短锁,常规规模无碍)。
 
 `watchlist.yaml` 示例(以 `watchlist.example.yaml` 为准):
 
@@ -112,7 +115,7 @@ icacls "%USERPROFILE%\.netsentinel\glm_key" /inheritance:r /grant:r "%USERNAME%:
 
 ```bat
 schtasks /Create /TN "NetSentinel巡查" /SC HOURLY /MO 6 ^
-  /TR "cmd /c cd /d C:\1\netsentinel && C:\1\netsentinel\.venv\Scripts\python.exe -m netsentinel.ops.scheduler --once >> data\logs\scheduler.log 2>&1" ^
+  /TR "cmd /c cd /d D:\3\netsentinel && D:\3\netsentinel\.venv\Scripts\python.exe -m netsentinel.ops.scheduler --once >> data\logs\scheduler.log 2>&1" ^
   /ST 08:00 /RU "%USERNAME%"
 ```
 
@@ -301,7 +304,7 @@ PY
 - [ ] `config.yaml` 按需开启:`allow_network`(抓取外网)、`vlm_online`(图像出境,见 VLM_GUIDE §3);`dry_run_default` 保持 `true`,首次真实提交用 `--exec` 显式触发;
 - [ ] 密钥走环境变量或 `~/.netsentinel/glm_key`,未写进任何会提交的文件;
 - [ ] `python -m playwright install chromium` 已执行(抽查一次截图存在);
-- [ ] REST / webui 只绑定 `127.0.0.1`;容器端口映射带 `127.0.0.1:` 前缀;
+- [ ] REST / webui 只绑定 `127.0.0.1`;容器端口映射带 `127.0.0.1:` 前缀;连接向导端口 `setup_port`(默认 8766)同为本机回环,用完即关;
 - [ ] `data/` 有备份方案;`evidence/` 有清理周期(ETHICS 第七节);
 - [ ] `AuditChain.verify('data/audit.jsonl')` 通过并纳入例行巡检;
 - [ ] 真实门户上线前:人工核验 www.12377.cn / www.shdf.gov.cn 当前表单结构与 `SELECTORS` 是否一致(见 README 路线图)。

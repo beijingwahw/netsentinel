@@ -659,3 +659,34 @@ def test_v5_failover_telemetry_switch_gauge_and_timer() -> None:
     assert snap2["counters"]["failover.switch"] == 4
     assert snap2["gauges"]["failover.circuit_open"] == 1
     assert snap2["timers"]["failover.classify"]["count"] == 4
+
+
+def test_v1021_lazy_factory_wiring_without_explicit_import() -> None:
+    """(V10.21 收口)惰性工厂直达:不显式 import failover 模块也能构造。
+
+    回归背景:注册链完整(failover.py 导入即自注册)但 classifier_base 的
+    ``_LAZY_IMPORT_MODULES`` 惰性表缺席,配置 ``classifier: failover`` 直达
+    会在成员循环被 warning 跳过(V10.21 席位4 实测);收口即在惰性表补
+    "failover" 映射。本测试用**干净子进程**复刻"未显式导入"现场。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = (
+        "from netsentinel.contracts import Config\n"
+        "from netsentinel.vision.classifier_base import get_classifier\n"
+        "cfg = Config()\n"
+        "cfg.vlm_fallback_chain = ['stub', 'stub:备份']\n"
+        "clf = get_classifier('failover', cfg)\n"
+        "print(type(clf).__name__)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "FailoverClassifier" in proc.stdout

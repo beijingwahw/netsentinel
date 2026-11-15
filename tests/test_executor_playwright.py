@@ -224,8 +224,11 @@ class TestV5Telemetry:
         telemetry.reset()
         seen: dict[str, object] = {}
 
-        def fake_run(plan, result, out_path, *, auto_confirm, headless):
+        # V10.20:execute 透传 dedup(cfg.evidence_pool_dedup,缺省开)到
+        # _run_with_browser —— 替身签名随新语义收下该开关
+        def fake_run(plan, result, out_path, *, auto_confirm, headless, dedup=True):
             seen["called"] = True
+            seen["dedup"] = dedup
             result.ok = True
             result.submitted = True
             return result
@@ -236,6 +239,7 @@ class TestV5Telemetry:
         result = execute(plan, cfg, dry_run=False)
 
         assert seen["called"] is True
+        assert seen["dedup"] is True  # 缺省 getattr(cfg, "evidence_pool_dedup", True)
         assert result.submitted is True
         snap = telemetry.snapshot()
         assert snap["timers"]["executor.run"]["count"] == 1
@@ -247,7 +251,7 @@ class TestV5Telemetry:
         """submitted=False 时绝不计 executor.submitted(仍计时)。"""
         telemetry.reset()
 
-        def fake_run(plan, result, out_path, *, auto_confirm, headless):
+        def fake_run(plan, result, out_path, *, auto_confirm, headless, dedup=True):
             result.ok = True
             result.submitted = False
             return result
@@ -1105,3 +1109,25 @@ class TestSelfHealingRedesignDrill:
         assert result.ok is False
         assert result.stopped_at == "填写举报链接"
         assert any("[错误]" in n for n in result.notes)
+
+
+# ---------------------------------------------------------------------------
+# V10.20:cfg.evidence_pool_dedup 开关透传(getattr 缺省 True,默认上线路径)
+# ---------------------------------------------------------------------------
+def test_v1020_cfg_evidence_pool_dedup_off_reaches_run_with_browser(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """配置 evidence_pool_dedup=False 时 execute 传 dedup=False(回旧口径)。"""
+    seen: dict[str, object] = {}
+
+    def fake_run(plan, result, out_path, *, auto_confirm, headless, dedup=True):
+        seen["dedup"] = dedup
+        result.ok = True
+        return result
+
+    monkeypatch.setattr(executor_playwright, "_run_with_browser", fake_run)
+    cfg = Config(data_dir=str(tmp_path))
+    cfg.evidence_pool_dedup = False  # 附加实例属性:getattr 读取路径(契约红线:不改 contracts)
+    result = execute(_make_plan([Step(StepAction.GOTO, "打开页面", value=MINI_FORM_URI)]), cfg, dry_run=False)
+    assert seen["dedup"] is False
+    assert result.ok is True

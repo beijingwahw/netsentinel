@@ -23,10 +23,24 @@ anthropic)在 user 文本前追加一行中文补偿指令 :data:`JSON_ONLY_HINT
 
 纯标准库、纯函数、零外呼;密钥只进入返回的 headers(红线 17:调用方负责
 打码后才能落日志)。
+
+V17 创世纪升级(G2 · 渲染缓存):``_encode_image`` 与 openai data URI 拼接
+``_data_uri`` 是真正纯的 O(图片大小) 子函数,按可哈希入参做**条目级有界
+LRU 缓存**(见 :data:`RENDER_CACHE_MAX`)——同图重复渲染(重试 / 跨方言
+对照 / 多提供方同图)零重编码,命中结果与逐次计算逐字节一致。两个入口
+函数**刻意不缓存**::
+
+- ``build_request``:带 ``telemetry.inc("dialect.build")`` 副作用,缓存会把
+  计数口径从"每次渲染"改成"每次缓存未命中";且 ``api_key`` 是其参数,
+  lru_cache 会把密钥存进缓存键——违反"密钥绝不缓存"红线,直接放弃;
+- ``parse_response``:入参 ``body`` 是不可哈希 dict,规范化成可哈希形态
+  (如按序 json.dumps)的成本与提取本身同阶,响应体又小,无真实收益,
+  宁缺毋滥。
 """
 from __future__ import annotations
 
 import base64
+import functools
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -39,6 +53,7 @@ __all__ = [
     "TEMPERATURE",
     "MAX_TOKENS",
     "ANTHROPIC_VERSION",
+    "RENDER_CACHE_MAX",
     "build_request",
     "parse_response",
 ]
@@ -71,6 +86,12 @@ CAPS: Mapping[str, Mapping[str, bool]] = MappingProxyType(
 #: 支持的 API 方言(CAPS 的键,顺序即文档顺序)
 SUPPORTED_STYLES: tuple[str, ...] = tuple(CAPS)
 
+#: (V17)渲染缓存容量(条目):``_encode_image`` / ``_data_uri`` 两个纯函数
+#: 的 LRU 上限。以"最近渲染的图片"为界,内存占用有界(极端 8MB 图约
+#: 每条目 3 份图片量级数据);缓存键只有图片字节 / mime / 裸 base64,
+#: **绝无密钥材料**。
+RENDER_CACHE_MAX: int = 16
+
 
 # ---------------------------------------------------------------------------
 # 内部小工具
@@ -86,6 +107,7 @@ def _validate_style(style: str, provider: str = "") -> None:
         )
 
 
+@functools.lru_cache(maxsize=RENDER_CACHE_MAX)
 def _encode_image(data: bytes, mime: str) -> tuple[str, str]:
     """图片字节 → ``(mime, 裸 base64)`` 恰好一次编码,各方言按需取用。
 
@@ -94,11 +116,24 @@ def _encode_image(data: bytes, mime: str) -> tuple[str, str]:
     - openai 方言的 data URI 前缀拼接推迟到 ``_build_openai`` 内完成——
       非 openai 方言不再为用不到的 data URI 付出一次 O(base64 长度) 的
       字符串拼接(V5:编码单次产出、产物按需成形);
-    - mime 缺省按 png 处理(与 A62 encode_image 的兜底口径一致)。
+    - mime 缺省按 png 处理(与 A62 encode_image 的兜底口径一致);
+    - (V17)纯函数 LRU 缓存:``bytes`` 按内容哈希,同一 ``(图片字节, mime)``
+      跨多次渲染只编码一次,命中返回同一不可变 ``(mime, base64)`` 元组,
+      与逐次计算逐字节等价;入参不含任何密钥材料(红线:密钥绝不缓存)。
     """
     raw = base64.b64encode(data).decode("ascii")
     media_type = mime or "image/png"
     return media_type, raw
+
+
+@functools.lru_cache(maxsize=RENDER_CACHE_MAX)
+def _data_uri(mime: str, raw: str) -> str:
+    """(V17)openai data URI 前缀拼接(纯函数,缓存):``data:<mime>;base64,<raw>``。
+
+    O(base64 长度) 的字符串拼接与编码同属渲染热路径成本,故与
+    ``_encode_image`` 同口径缓存;入参同样不含密钥材料。
+    """
+    return f"data:{mime};base64,{raw}"
 
 
 def _compensated_user(style: str, user: str) -> str:
@@ -155,8 +190,9 @@ def build_request(
     """
     _validate_style(style, provider)
     base = base_url.rstrip("/")
-    # 每张图恰好编码一次(多图互不影响;同一 bytes 传两遍也按两张图各编一次,
-    # 与 A62 的逐图语义一致);遥测只计成功渲染的请求(未知方言抛错不计)
+    # 每张图按 (字节, mime) 取编码(V17 渲染缓存:同图跨渲染零重编码;
+    # 同一 bytes 传两遍仍产出两个相同图片块,输出形态与逐图编码完全一致);
+    # 遥测只计成功渲染的请求(未知方言抛错不计)
     encoded = [_encode_image(data, mime) for data, mime in images]
     telemetry.inc("dialect.build")
     if style == "openai":
@@ -188,7 +224,7 @@ def _build_openai(
         parts.extend(
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{raw}"},
+                "image_url": {"url": _data_uri(mime, raw)},
             }
             for mime, raw in encoded
         )

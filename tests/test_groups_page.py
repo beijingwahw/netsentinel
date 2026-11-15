@@ -21,6 +21,7 @@ from webui.groups_page import (
     VERDICT_CN,
     attest_badge,
     batch_preview,
+    group_labels,
     group_rows,
     portal_cn,
 )
@@ -98,9 +99,9 @@ def test_group_rows_verdict_cn_mapping() -> None:
         ]
     )
     assert [r["verdict"] for r in rows] == [
-        "无风险",
+        "未见违规",
         "疑似",
-        "高置信色情",
+        "高置信",
         "疑似",
     ]
 
@@ -194,7 +195,7 @@ def test_group_rows_integration_with_group_entries() -> None:
     assert by_name["a.com"]["entries"] == 2
     assert by_name["a.com"]["sites"] == 2
     assert by_name["a.com"]["aliases"] == 2  # www.a.com + img.a.com
-    assert by_name["a.com"]["verdict"] == "高置信色情"  # 组内最严重档
+    assert by_name["a.com"]["verdict"] == "高置信"  # 组内最严重档
     assert by_name["b.com"]["entries"] == 1
     assert by_name["b.com"]["verdict"] == "疑似"
 
@@ -217,7 +218,7 @@ def test_attest_badge_constants() -> None:
     """徽章与展示常量口径固定(中文界面,避免散落魔法字符串)。"""
     assert BADGE_ATTESTED == "✓ 已声明"
     assert BADGE_UNATTESTED == "✗ 未声明"
-    assert VERDICT_CN == {"clean": "无风险", "suspect": "疑似", "nsfw": "高置信色情"}
+    assert VERDICT_CN == {"clean": "未见违规", "suspect": "疑似", "nsfw": "高置信"}
 
 
 # ---------------------------------------------------------------------------
@@ -294,3 +295,39 @@ def test_pure_layer_importable_without_streamlit() -> None:
     ):
         assert name in groups_page.__all__
         assert callable(getattr(groups_page, name))
+
+
+# ---------------------------------------------------------------------------
+# V10.20:同名/空名组的选择器标签(吞组修复)
+# ---------------------------------------------------------------------------
+
+
+def test_group_labels_disambiguates_same_name_groups() -> None:
+    """同名组加 (第N组) 后缀保证标签唯一;真实组名不带后缀。
+
+    背景(V10.20 修复):多个解析失败 URL 的空名组各自成组但 name 相同,
+    组详情页 ``{label: group}`` 字典去重会"吞组"(后者覆盖前者,排前面的
+    组无法被选中与声明)。
+    """
+    groups = [
+        SimpleNamespace(name="a.com"),
+        SimpleNamespace(name="a.com"),
+        SimpleNamespace(name="a.com"),
+        SimpleNamespace(name="b.org"),
+    ]
+    pairs = group_labels(groups)
+    labels = [label for label, _name in pairs]
+    assert labels == ["a.com", "a.com(第2组)", "a.com(第3组)", "b.org"]
+    # 真实组名不带后缀(声明键与 ready_entries 按名匹配口径一致)
+    assert [name for _label, name in pairs] == ["a.com", "a.com", "a.com", "b.org"]
+
+
+def test_group_labels_empty_and_unnamed_groups() -> None:
+    """空输入 → [];空名组展示 "(未命名)"、真实名为空串(UI 拒绝空名声明)。"""
+    assert group_labels(None) == []
+    assert group_labels([]) == []
+    pairs = group_labels([SimpleNamespace(name=""), SimpleNamespace(name="")])
+    assert [label for label, _n in pairs] == ["(未命名)", "(未命名)(第2组)"]
+    assert [name for _l, name in pairs] == ["", ""]
+    # dict 容错:纯 dict 组同样可读 name
+    assert group_labels([{"name": "d.com"}]) == [("d.com", "d.com")]

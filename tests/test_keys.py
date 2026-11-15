@@ -426,7 +426,9 @@ def test_set_key_windows_icacls_bytes_captured_nonzero_only_warns(
     assert pathlib.Path(path).is_file()  # 密钥文件照常写入
     assert len(calls) == 1 and calls[0][0][0] == "icacls"  # 确实尝试过 icacls
     cmd, kwargs = calls[0]
-    assert "tester:F" in cmd  # 授权当前用户
+    # 授权当前用户(V10.12 起账户名为 DOMAIN\user 限定形式,USERDOMAIN
+    # 存在时以域名限定;断言同时匹配裸账户与域名限定两种形态)
+    assert str(cmd[-1]).endswith("tester:F")
     assert kwargs.get("capture_output") is True  # 字节捕获
     assert not kwargs.get("text")  # 绝不解码输出,只看退出码
     assert "未能自动收紧权限" in caplog.text

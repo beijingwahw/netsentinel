@@ -8,7 +8,8 @@
   等待的秒数(0 = 立即获得);真实路径用 ``time.sleep`` 按缺口分段等待;
 - ``try_acquire(provider) -> bool``:非阻塞,适合"可跳过"的场景;
 - ``state(provider) -> {"tokens": float, "rpm": int}``:只读观测,不消费;
-- 未注册的提供方以 ``DEFAULT_RPM`` 动态建桶(线程安全)。
+- 未注册的提供方以 ``DEFAULT_RPM`` 动态建桶(线程安全);构造参数
+  ``default_rpm`` 可覆盖该缺省(A74 vlm_client 接线用,不传则行为不变)。
 
 时钟注入:``clock`` 需具备 ``time.monotonic`` 语义(返回单调递增秒);
 若注入对象额外提供可调用的 ``sleep(seconds)``(如测试用 FakeClock),
@@ -80,14 +81,19 @@ class ProviderThrottle:
         rpm_hints: dict[str, int] | None = None,
         *,
         clock: Callable[[], float] | None = None,
+        default_rpm: int | None = None,
     ) -> None:
         """构造限速器。
 
         :param rpm_hints: 提供方 → 每分钟调用上限提示;未登记的提供方用
-            ``DEFAULT_RPM``。非法值(<1)回退默认并告警。
+            ``DEFAULT_RPM``(或 ``default_rpm``,见下)。非法值(<1)回退默认并告警。
         :param clock: 可注入时钟,``time.monotonic`` 语义(无参调用返回
             单调递增秒);缺省用 ``time.monotonic``。若该对象附带可调用的
             ``sleep(seconds)``,阻塞等待将用它推进模拟时间(离线测试)。
+        :param default_rpm: (A74 vlm_client 接线用)未登记提供方的默认
+            每分钟调用上限;``None``(缺省)= 沿用 :data:`DEFAULT_RPM`,
+            既有行为不变;``>=1`` 的整数覆盖之,非法值(<1 / 不可数值化)
+            告警后忽略、回落 ``DEFAULT_RPM``。
         """
         self._rpm_hints: dict[str, int] = {}
         for name, rpm in dict(rpm_hints or {}).items():
@@ -99,6 +105,20 @@ class ProviderThrottle:
                 )
                 rpm = DEFAULT_RPM
             self._rpm_hints[str(name)] = rpm
+
+        self._default_rpm: int | None = None
+        if default_rpm is not None:
+            try:
+                fallback_rpm = int(default_rpm)
+            except (TypeError, ValueError):
+                fallback_rpm = None
+            if fallback_rpm is None or fallback_rpm < 1:
+                logger.warning(
+                    "默认 rpm 非法(%r),忽略,沿用 DEFAULT_RPM=%d",
+                    default_rpm, DEFAULT_RPM,
+                )
+            else:
+                self._default_rpm = fallback_rpm
 
         self._lock = threading.Lock()
         self._buckets: dict[str, _Bucket] = {}
@@ -114,10 +134,17 @@ class ProviderThrottle:
     # -- 内部 ---------------------------------------------------------------
 
     def _bucket_for(self, provider: str) -> _Bucket:
-        """取(或按 DEFAULT_RPM 动态创建)提供方的桶。调用方必须已持锁。"""
+        """取(或动态创建)提供方的桶。调用方必须已持锁。
+
+        未登记提供方的 RPM:``default_rpm``(构造时给出且合法)优先,
+        否则 ``DEFAULT_RPM``。
+        """
         bucket = self._buckets.get(provider)
         if bucket is None:
-            rpm = self._rpm_hints.get(provider, DEFAULT_RPM)
+            rpm = self._rpm_hints.get(
+                provider,
+                self._default_rpm if self._default_rpm is not None else DEFAULT_RPM,
+            )
             bucket = _Bucket(rpm, self._clock())
             self._buckets[provider] = bucket
             logger.debug("为提供方 %s 动态创建限速桶(RPM=%d)", provider, rpm)

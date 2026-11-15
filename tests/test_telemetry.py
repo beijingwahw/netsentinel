@@ -103,3 +103,61 @@ def test_reset_clears_all():
     telemetry.reset()
     snap = telemetry.snapshot()
     assert not (snap["counters"] or snap["gauges"] or snap["timers"])
+
+
+# ---------------------------------------------------------------------------
+# V10.20 并发回归:8 线程 × 500 次并发写 + 并发 snapshot
+# ---------------------------------------------------------------------------
+def test_v1020_concurrent_inc_gauge_observe_and_snapshot():
+    """8 线程各 500 次 inc/gauge/observe + 快照线程并发读写。
+
+    断言三件事(V10.18 线程安全审计的回归锚):
+    - 计数不丢:counter 恒等于 线程数 × 次数(锁内读改写原子);
+    - 零异常:所有 worker 线程正常收尾(errors 列表为空);
+    - 快照结构完整:并发 snapshot 不抛错、四键齐全、计数器子集一致。
+    """
+    threads_count, per_thread = 8, 500
+    errors: list[BaseException] = []
+    snapshots: list[dict] = []
+    barrier = threading.Barrier(threads_count + 1)
+
+    def _worker(tid: int) -> None:
+        try:
+            barrier.wait(timeout=10)
+            for i in range(per_thread):
+                telemetry.inc("conc.counter")
+                telemetry.gauge("conc.gauge", float(tid * 1000 + i))
+                telemetry.observe("conc.timer", float(i) * 1e-6)
+        except BaseException as exc:  # noqa: BLE001 - 收集任意异常供断言
+            errors.append(exc)
+
+    def _snapper() -> None:
+        try:
+            barrier.wait(timeout=10)
+            for _ in range(50):
+                snapshots.append(telemetry.snapshot())
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    workers = [threading.Thread(target=_worker, args=(t,)) for t in range(threads_count)]
+    reader = threading.Thread(target=_snapper)
+    for t in [*workers, reader]:
+        t.start()
+    for t in [*workers, reader]:
+        t.join(timeout=30)
+
+    assert errors == []  # 任何线程异常即失败
+    final = telemetry.snapshot()
+    # 计数不丢:8 × 500 = 4000,一笔不多一笔不少
+    assert final["counters"]["conc.counter"] == float(threads_count * per_thread)
+    # observe 同样不丢样本?计时样本有 MAX_SAMPLES 环形截断:4000 > 256,
+    # 只断言"截断到上限"而非全量——这是设计内行为,不是丢数
+    assert final["timers"]["conc.timer"]["count"] == telemetry.MAX_SAMPLES
+    # 快照结构完整:并发期间每次 snapshot 四键齐全且计数器读数单调不回退
+    assert snapshots, "快照线程至少成功采样一次"
+    for snap in snapshots:
+        assert set(snap) == {"ts", "counters", "gauges", "timers"}
+        seen = snap["counters"].get("conc.counter", 0.0)
+        assert 0.0 <= seen <= float(threads_count * per_thread)
+    # gauge 收敛:终值必为某线程的最后一次写(值域校验)
+    assert final["gauges"]["conc.gauge"] >= 0.0

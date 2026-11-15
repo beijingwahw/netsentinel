@@ -154,6 +154,33 @@ vlm_fallback_chain: ["glm:glm-5.3-flash", "openai:gpt-4o-mini", "ollama:llava"]
 
 链成员写法就是 §1 的②③形态,可混搭云端与本地;去重按 spec 精确匹配,重复项自动去重。链合法性可用 `vlmctl doctor` 逐条检查(§6)。
 
+### 5.1 断路器(V5 A88,默认开启)
+
+`FailoverClassifier` 为每个链成员维护一个三态断路器,把"反复撞已挂成员"的时间浪费变成"熔断期间直接跳过":
+
+| 状态 | 进入条件 | 行为 |
+| --- | --- | --- |
+| `closed`(闭路) | 初始 / 任一次成功复位 | 正常尝试该成员 |
+| `open`(熔断) | **连续 3 次**非配置类失败(`CIRCUIT_FAILURE_THRESHOLD=3`) | 冷却 **30 秒**(`CIRCUIT_COOLDOWN_SECONDS`)内各图直接跳过该成员——跳过计入 `fallback_from`,并在胜者 `scores` 补 `note="熔断"`(不覆盖成员自带 note) |
+| `half_open`(半开) | 冷却期满 | 放行该成员的**下一次尝试**:成功 → 复位闭路;失败 → 重新熔断 30 秒 |
+
+口径要点:
+
+- **配置类异常不计熔断**(`VlmConfigError` / `ModelNotFoundError`):配置问题不随时间自愈,重试无意义,但也不污染失败计数;
+- **链尽语义不变**:全链尽仍按既有规则上抛(最后非配置异常 > 全配置错中文汇总 > 全熔断跳过时抛带"熔断"说明的中文 RuntimeError);
+- **留痕**:每次成员转移 `telemetry.inc("failover.switch")`;每次 `classify` 后 `gauge("failover.circuit_open", 当前熔断成员数)` 并以 `timer("failover.classify")` 计时;`scores.fallback_from` 列出此前失败/被熔断跳过的成员名,`model="failover→{胜者名}"` 标注实际应答方;
+- 断路器可整体关闭(`FailoverClassifier(..., circuit_breaker=False)` 完全恢复 A68 旧行为);时钟可注入供测试推进冷却窗口。
+
+### 5.2 当前通电状态(如实标注,V10.21 核查)
+
+`failover` 内核本身功能完备(链转移 / 断路器 / 预算一本账),`vlm_fallback_chain` 也是 `Config` 一等字段(`netsentinel/contracts.py:315`,缺省空链)。但截至 V10.21 席位4 核查存在**一个真实断点**:
+
+- `failover.py` 末尾 `register_classifier("failover", FailoverClassifier)`(`netsentinel/vision/failover.py:527`)依赖**模块被导入**才注册;
+- `classifier_base` 的惰性导入映射 `_LAZY_IMPORT_MODULES`(`netsentinel/vision/classifier_base.py:50-56`)只含 stub / nudenet / clip / glm / guard,**不含 failover**;产品代码也没有任何路径导入该模块(仅 `scripts/demo_multi_provider.py` 与测试直接导入);
+- 实测:`get_classifier("failover", cfg)`(未先行导入时)报 `ValueError: 未知视觉模型提供方:failover...`(转交 multi_provider 后 parse_spec 失败);先行 `import netsentinel.vision.failover` 后同调用构造成功、链正确取自 `cfg.vlm_fallback_chain`。
+
+**影响**:配置里写 `classifier: failover` 后,`run_scan` 取主分类器会抛 ValueError 被成员循环跳过(记 warning),除非进程内恰好有别的代码先导入过该模块。**最小接线方案(已登记移交,本波未实施)**:在 `classifier_base._LAZY_IMPORT_MODULES` 增加一行 `"failover": "netsentinel.vision.failover"`(与 stub/glm/guard 同款"导入即自注册"机制);该文件在本席位领地之外(vision/** 只读),由负责人收口。临时可用姿势:在自己的入口脚本里先 `import netsentinel.vision.failover` 再扫描。
+
 ---
 
 ## 6. vlmctl 诊断 CLI 四命令
@@ -251,3 +278,9 @@ report = analyze(all_member_scores)   # 扫描管线外/复核台内离线计算
 > 20. **ping/doctor 是唯一允许外呼的诊断动作**,且只能由人在 `vlmctl` 里手动触发;常规扫描/测试零外呼。
 
 一句话总结:模型与端点都是提示值(18),上线前人工 `ping` 核验一次(20);密钥只藏在三种配置途径里、任何输出不回显(17);打出去的每一次调用都有闸门(16)和一本账(19)。
+
+---
+
+## 10. 附注:prompt_dialects 是参考实现,非生产路径
+
+`netsentinel/vision/prompt_dialects.py`(A72)是三方言(openai / anthropic / gemini)请求渲染的**纯函数参考实现**——模块自述定位为"同构参考实现……供测试对照与未来新方言扩展"(`prompt_dialects.py` 模块 docstring),生产传输一律走 `vlm_client.UniversalVLMClient`(带闸门/重试/日志的真实链路);两边的请求语义逐字段一致,以 A62 真实实现为准。使用与维护时请勿把它当作生产路径接线(V10.17 H3 死代码核查同口径:"先进内核默认关"哲学,测试对照件定位)。

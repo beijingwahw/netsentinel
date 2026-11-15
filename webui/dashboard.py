@@ -13,6 +13,8 @@
   * :func:`policy_preview`    政策引擎决策 → 中文一行预览;
   * :func:`ledger_health`     事件账本健康行(读侧零写入,A234);
   * :func:`ledger_path_from_cfg` cfg 附加属性 event_ledger 的读取口径;
+  * :func:`load_report_dict_cached` 证据包 manifest 的 mtime 键控 LRU 缓存
+    (V10.18 性能,结果与 webui.app.load_report_dict 直调恒等);
   * :data:`EDGE_KIND_CN` 等展示用中文映射常量。
 - UI 层(下半部分,streamlit 顶部惰性 try/except,缺依赖时 main() 打印
   中文安装提示并返回退出码 1):
@@ -46,7 +48,10 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import sys
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from netsentinel import telemetry
@@ -62,6 +67,14 @@ except ImportError:  # pragma: no cover - 取决于运行环境
     st = None  # type: ignore[assignment]
     _HAS_ST = False
 
+# ---------------------------------------------------------------------------
+# 共享标签口径(webui/_labels.py 单一权威定义;双路导入兼容脚本直跑)
+# ---------------------------------------------------------------------------
+try:
+    from webui._labels import STATUS_CN
+except ImportError:  # streamlit run webui/dashboard.py 时 sys.path[0]=webui/
+    from _labels import STATUS_CN  # type: ignore[no-redef]
+
 __all__ = [
     "trend_rows",
     "agreement_matrix",
@@ -69,6 +82,10 @@ __all__ = [
     "policy_preview",
     "ledger_health",
     "ledger_path_from_cfg",
+    "load_report_dict_cached",
+    "clear_manifest_cache",
+    "four_eyes_key",
+    "MANIFEST_CACHE_LIMIT",
     "EDGE_KIND_CN",
     "ACTION_CN",
     "render",
@@ -112,13 +129,24 @@ ACTION_CN: dict[str, str] = {
     "four_eyes": "四眼复核",
 }
 
-#: 队列状态 → 中文(UI 展示用)。
-_STATUS_CN: dict[str, str] = {
-    "pending": "待复核",
-    "approved": "已批准",
-    "rejected": "已驳回",
-    "submitted": "已提交",
-}
+
+def four_eyes_key(kind: str, entry_id: int) -> str:
+    """四眼复核控件 key(V10.20 形式化;纯逻辑层)。
+
+    页签④每次只渲染**选中**的那一条 pending 条目,entry_id 在页内唯一;
+    kind ∈ reviewer / confirm / approve(审核人姓名 / 双重确认 / 批准按钮)。
+    唯一性由 tests/test_webui_key_audit.py 锁定。
+
+    示例::
+
+        >>> four_eyes_key("approve", 3)
+        'fe_approve_3'
+    """
+    return f"fe_{kind}_{int(entry_id)}"
+
+#: 队列状态 → 中文(UI 展示用;A233 起权威定义在 webui/_labels.py,
+#: 本名为本页历史常量名,指向同一字典对象)。
+_STATUS_CN: dict[str, str] = STATUS_CN
 
 
 def _field(src: Any, name: str, default: Any = "") -> Any:
@@ -407,6 +435,80 @@ def ledger_health(event_log: Any) -> dict:
         }
 
 
+# ---------------------------------------------------------------------------
+# load_report_dict_cached:证据包 manifest 的 mtime 键控 LRU 缓存
+# (V10.18 性能,纯逻辑层;为 UI 层 _load_report 服务)
+# ---------------------------------------------------------------------------
+
+#: manifest 缓存条数上限(超出按 LRU 淘汰最久未用键)。
+MANIFEST_CACHE_LIMIT: int = 256
+
+#: 模块级缓存:复合键(候选路径 × mtime_ns)→ 解析出的报告 dict(或 None)。
+#: streamlit 多会话线程共享,一切字典操作在 :data:`_manifest_cache_lock` 内。
+_manifest_cache: "OrderedDict[tuple[tuple[str, int], ...], dict | None]" = OrderedDict()
+_manifest_cache_lock = threading.Lock()
+
+
+def _mtime_ns(path: Path) -> int:
+    """取文件 mtime(纳秒);不存在 / 不可读按 -1(参与键,仍可区分存在性)。"""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
+def clear_manifest_cache() -> None:
+    """清空 manifest 缓存(测试与运维用;锁内只做一次 clear)。"""
+    with _manifest_cache_lock:
+        _manifest_cache.clear()
+
+
+def load_report_dict_cached(evidence_zip: str) -> dict | None:
+    """``webui.app.load_report_dict`` 的 mtime 键控缓存版(结果完全一致)。
+
+    背景:一致性页签每次 rerun 最多回读 :data:`_MAX_MANIFEST_ENTRIES`
+    (100)个证据包 manifest,逐个 zip 打开 + 读取 + JSON 解析;streamlit
+    任意控件交互都会触发 rerun,重复解析同一批未变化的包纯属浪费。
+
+    - 键 = ``load_report_dict`` 全部候选定位路径的 ``(路径, mtime_ns)``
+      复合——zip 输入时为 ``[去掉 .zip 的 bundle/manifest.json(边车,
+      优先), path/manifest.json(目录形态), path 本体(直传 manifest /
+      zip 内兜底也随 zip 文件 mtime 变化)]`` 的 mtime;任一相关文件被
+      重写(mtime 变化)即换键失效,不存在路径字符串碰撞;
+    - 命中零回读:不再打开 zip / 读文件 / 解析 JSON(仅剩 stat 元数据
+      取键,这是 mtime 键控的固有成本);未命中则调原函数并把结果
+      (含 None)入缓存;
+    - 上限 :data:`MANIFEST_CACHE_LIMIT`(256)条,超出按 LRU 淘汰最久
+      未用键;命中即刷新 recency;
+    - 等价性:同一 manifest(键不变)两次调用返回同一对象、值与
+      ``load_report_dict`` 直调恒等;manifest 变更(mtime 变)后下一次
+      调用重新读取——由 tests/test_dashboard_helpers.py 用例锁定。
+      **缓存对象按只读共享**:命中返回的是缓存里的同一 dict,调用方
+      不得就地修改(本模块所有调用点均只读)。
+    """
+    from webui.app import load_report_dict  # 兄弟模块函数内导入
+
+    raw = (evidence_zip or "").strip()
+    if not raw:
+        return load_report_dict(raw)  # 空路径无 IO,直通(与原函数同为 None)
+    path = Path(raw)
+    candidates = [path, path / "manifest.json"]
+    if path.suffix.lower() == ".zip":
+        candidates.insert(0, path.with_suffix("") / "manifest.json")
+    key = tuple((str(c), _mtime_ns(c)) for c in candidates)
+    with _manifest_cache_lock:
+        if key in _manifest_cache:
+            _manifest_cache.move_to_end(key)
+            return _manifest_cache[key]
+    value = load_report_dict(raw)
+    with _manifest_cache_lock:
+        _manifest_cache[key] = value
+        _manifest_cache.move_to_end(key)
+        while len(_manifest_cache) > MANIFEST_CACHE_LIMIT:
+            _manifest_cache.popitem(last=False)
+    return value
+
+
 # ===========================================================================
 # UI 层(以下代码仅在 streamlit 运行时执行;兄弟模块一律函数内导入)
 # ===========================================================================
@@ -427,10 +529,13 @@ _FOUR_EYES_STATE_CN: dict[str, str] = {
 
 
 def _load_report(entry: Any) -> dict | None:
-    """从条目的证据包读回报告 dict(复用 A30 app.py 的 manifest 定位逻辑)。"""
-    from webui.app import load_report_dict  # 兄弟模块函数内导入
+    """从条目的证据包读回报告 dict(mtime 键控缓存,命中零 IO)。
 
-    return load_report_dict(str(_field(entry, "evidence_zip", "")))
+    V10.18:一致性页签每次 rerun 最多回读 100 个证据包,改为经
+    :func:`load_report_dict_cached`(纯逻辑层,结果与直调
+    ``webui.app.load_report_dict`` 恒等);调用点只读,不改缓存对象。
+    """
+    return load_report_dict_cached(str(_field(entry, "evidence_zip", "")))
 
 
 @dataclass
@@ -659,6 +764,11 @@ def _render_policy_and_four_eyes(
     except ImportError:
         st.warning("四眼复核模块(netsentinel.decision.four_eyes)未就位。")
         return
+    # V10.20:批准成功后经 rerun 即时刷新上方状态区(第二审核人引导依赖它),
+    # 结果文案用 flash 暂存,本轮 rerun 后顶部回显、随即清除。
+    flash = st.session_state.pop("_fe_flash", None)
+    if flash:
+        st.success(flash)
     four_eyes_on = st.checkbox(
         "启用四眼复核(双人批准)",
         value=bool(cfg.four_eyes_required),
@@ -690,11 +800,11 @@ def _render_policy_and_four_eyes(
             f"- 已确认审核人:{('、'.join(str(r) for r in reviewers)) if reviewers else '(无)'}\n"
             f"- 四眼要求:{'双人批准' if status.get('required') else '单人即可(四眼未启用)'}"
         )
-        reviewer = st.text_input("审核人姓名", value="", key=f"fe_reviewer_{entry_id}")
-        confirmed = st.checkbox(_CONFIRM_LABEL, key=f"fe_confirm_{entry_id}")
+        reviewer = st.text_input("审核人姓名", value="", key=four_eyes_key("reviewer", entry_id))
+        confirmed = st.checkbox(_CONFIRM_LABEL, key=four_eyes_key("confirm", entry_id))
         if st.button(
             "批准(四眼)",
-            key=f"fe_approve_{entry_id}",
+            key=four_eyes_key("approve", entry_id),
             type="primary",
             disabled=not confirmed,
         ):
@@ -703,9 +813,14 @@ def _render_policy_and_four_eyes(
                 st.warning("请填写审核人姓名。")
             else:
                 try:
-                    st.success(_four_eyes_result_cn(queue.approve(entry_id, name)))
+                    result = queue.approve(entry_id, name)
                 except ValueError as exc:
                     st.warning(f"{exc}")
+                else:
+                    # V10.20:rerun 即时刷新状态区(第一审核人确认后页面须
+                    # 立即显示"等待第二审核人"引导);文案经 flash 暂存回显。
+                    st.session_state["_fe_flash"] = _four_eyes_result_cn(result)
+                    st.rerun()
         st.caption("四眼批准只完成复核留痕;举报提交仍须在复核台/CLI 走人工门,本页面不执行提交。")
     finally:
         if ledger is not None:
@@ -819,4 +934,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    # V10.20(SystemExit 收尾修复,同 webui/app.py):streamlit 脚本线程内
+    # 不抛 SystemExit(BaseException 会杀死脚本线程,AppTest 通道失效);
+    # 仅真直跑才转进程退出码(保留缺依赖提示退出码 1 契约)。
+    _in_script_thread = False
+    if _HAS_ST:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+            _in_script_thread = get_script_run_ctx() is not None
+        except Exception:  # noqa: BLE001 - 内部 API 缺席按直跑处理
+            _in_script_thread = False
+    if not _in_script_thread:
+        raise SystemExit(_exit_code)

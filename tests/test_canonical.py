@@ -304,3 +304,76 @@ def test_canonical_key_idempotent_on_registrable() -> None:
     for url in domain_urls:
         key = canonical_key(url)
         assert key and canonical_key(f"https://{key}/") == key, url
+
+
+# ---------------------------------------------------------------------------
+# V10.18 lru_cache(2048):缓存开/关结果全等(等价性证明)
+# ---------------------------------------------------------------------------
+
+def _random_url_pool(n: int = 200) -> list[str]:
+    """确定性随机生成 n 条混合形态 URL(合法/畸形/IP/单标签/空串)。"""
+    import random
+
+    rng = random.Random(20261018)
+    hosts = [
+        "example.com", "a.b.example.com.cn", "www.shop.co.uk", "mail.net.cn",
+        "deep.sub.host.example.com", "localhost", "192.168.10.7",
+        "2001:0DB8::0001", "xn--fiqs8s.com", "not_a_host", "x.数字尾",
+    ]
+    schemes = ["http", "https", "ftp", ""]
+    ports = ["", ":8080", ":443", ":99999"]
+    paths = ["", "/", "/a/b/c", "/x?y=1&z=2#frag"]
+    pool: list[str] = []
+    for _ in range(n):
+        scheme = rng.choice(schemes)
+        sep = "://" if scheme else ""
+        url = f"{scheme}{sep}{rng.choice(hosts)}{rng.choice(ports)}{rng.choice(paths)}"
+        pool.append(url)
+    pool += ["", "   ", "not a url", "http://[::1]:8080/", "http://user:pw@h.com/"]
+    return pool
+
+
+def test_canonical_key_lru_cache_equivalence() -> None:
+    """等价性:随机 URL 集合上,缓存开(canonical_key)与关
+    (``__wrapped__`` 未缓存原函数)结果逐条全等;含重复调用(命中路径)
+    与 cache_clear 后重算(未命中路径)。"""
+    uncached = canonical_key.__wrapped__
+    canonical_key.cache_clear()
+    for url in _random_url_pool(200):
+        expected = uncached(url)
+        assert canonical_key(url) == expected, url          # 未命中(冷)
+        assert canonical_key(url) == expected, url          # 命中(热)
+        canonical_key.cache_clear()
+        assert canonical_key(url) == expected, url          # 清后再算仍全等
+        canonical_key.cache_clear()
+
+
+def test_canonical_key_lru_cache_engaged_and_bounded() -> None:
+    """缓存确实生效(hit>0)且容量恒为 2048(lru_cache 线程安全、LRU 淘汰)。"""
+    canonical_key.cache_clear()
+    urls = _random_url_pool(50)
+    for url in urls:
+        canonical_key(url)
+    for url in urls:
+        canonical_key(url)
+    info = canonical_key.cache_info()
+    assert info.maxsize == 2048
+    assert info.hits >= 50          # 第二轮全部走命中
+    assert info.currsize <= 2048    # 容量有界
+    canonical_key.cache_clear()
+
+
+def test_canonical_key_lru_cache_eviction_still_equivalent() -> None:
+    """淘汰压力:灌入 3000 > 2048 个互异键强制 LRU 淘汰后,
+    首批结果仍与未缓存原函数全等(淘汰不改变语义)。"""
+    uncached = canonical_key.__wrapped__
+    canonical_key.cache_clear()
+    first = [f"http://s{i}.example{i}.com/p{i}" for i in range(300)]
+    for url in first:
+        canonical_key(url)
+    for i in range(2048):  # 挤出首批
+        canonical_key(f"http://evict{i}.e{i}.io/")
+    for url in first:
+        assert canonical_key(url) == uncached(url), url
+    assert canonical_key.cache_info().currsize <= 2048
+    canonical_key.cache_clear()

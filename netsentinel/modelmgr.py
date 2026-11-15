@@ -41,10 +41,10 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 from netsentinel import telemetry
+from netsentinel import timesource
 from netsentinel.contracts import Config
 
 __all__ = ["main", "CliError", "UsageError"]
@@ -247,7 +247,7 @@ def _fmt_time(value: Any) -> str:
         return "未知"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
-            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
+            return timesource.fromtimestamp_local(float(value)).strftime("%Y-%m-%d %H:%M:%S")
         except (OverflowError, OSError, ValueError):
             return str(value)
     return str(value)

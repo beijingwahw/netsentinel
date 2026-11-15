@@ -549,7 +549,13 @@ def decide(report: SiteReport, rules: list[Rule] | None = None) -> Decision:
         match = rule._match
         if match is None:  # 程序化构造的规则:首次触达时编译并缓存
             match = _warm(rule)._match
-        assert match is not None  # _warm 保证已编译
+        if match is None:  # 理论不可达(_warm 恒返回已编译规则)
+            # V10.18:生产路径 assert 在 -O 下被剥离(语义漂移),改显式
+            # RuntimeError——正常路径零变化,异常路径报错类型更明确。
+            raise RuntimeError(
+                f"规则 {rule.name!r} 的匹配器编译失败(when={rule.when!r}):"
+                "内部不变量违例(_warm 应保证已编译),请检查规则构造"
+            )
         if match(report):
             telemetry.inc(f"policy.decide.{rule.action}")
             hit = Decision(

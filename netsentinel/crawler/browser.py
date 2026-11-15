@@ -6,6 +6,15 @@
 V5 升级:launch/goto 瞬态超时自动重试 1 次;截图命名同秒碰撞安全;超长属性
 防护;telemetry(capture.page/degraded/screenshot/errors/transient_retry)。
 
+V10.24 升级(goto 超时优雅降级,V10.23 实弹遗留②):页级 goto 超时不再
+击穿整站扫描——三级降级链:① goto 瞬态超时重试 1 次(V5 既有)→ ② 重试
+用尽则整页退回 urllib 退化采样(与"缺 playwright 退化"同源:仅 HTML、
+**无截图、无懒加载触发**;计 ``capture.degraded_pages``)→ ③ urllib 也
+失败(非 200/抛错)才把该页记为采样错误(``capture.errors``):批量路径
+**继续其余页**(页级失败绝不杀整扫,样本数变少如实呈现),单页路径维持
+异常上抛语义(fail-fast,与逐页调用传播一致)。非超时类异常(安全闸门/
+chromium 损坏等)不进降级链,行为与 V5 以来逐字节不变。
+
 安全红线:``allow_network=False`` 时浏览器仅允许导航本机地址(127.0.0.0/8
 回环段与 ::1;外网一律拒绝)。图片下载复用 fetcher 的安全闸门。
 
@@ -25,11 +34,13 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from html.parser import HTMLParser
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import urljoin, urlsplit
 
 from netsentinel import telemetry
+from netsentinel import timesource
 from netsentinel.contracts import Config, ImageEvidence, PageSample
 
 __all__ = [
@@ -38,7 +49,10 @@ __all__ = [
     "SLOW_CAPTURE_WARN_S",
     "TEXT_HINTS",
     "ImgExtractor",
+    "browser_session",
     "capture_page",
+    "capture_pages",
+    "capture_pages_iter",
 ]
 
 logger = logging.getLogger(__name__)
@@ -58,12 +72,19 @@ TEXT_HINTS = ["色情", "成人电影", "裸聊", " AV ", "情色", "porn", "sex
 #: 截图名时间戳格式(HHMMSS)
 _SHOT_TS_FORMAT = "%H%M%S"
 
-#: 默认策略下放行的本机 host(另经 :func:`_is_loopback_host` 放行 127/8 与 ::1)
+#: 默认策略下放行的本机 host(另经 :func:`_is_loopback_host` 放行 127/8 与 ::1)。
+#: 回环口径三处统一(修改任何一处须同步):crawler/fetcher.py、
+#: crawler/browser.py、crawler/redirect.py——都认 127.0.0.1 / localhost / ::1,
+#: 且 127.0.0.0/8 全段与 ::1 经 ipaddress 判定一并放行(不离开本机)。
 _LOCAL_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def _is_loopback_host(host: str) -> bool:
-    """127.0.0.0/8 全段与 ::1 均为本机回环,放行(不离开本机)。"""
+    """127.0.0.0/8 全段与 ::1 均为本机回环,放行(不离开本机)。
+
+    与 crawler/fetcher.py 的同名函数为镜像实现(口径锁:127/8 + ::1);
+    修改此处须同步 fetcher.py 与 redirect.py 的回环判定。
+    """
     import ipaddress
 
     try:
@@ -84,7 +105,14 @@ def _ensure_local_navigation(url: str, cfg: Config) -> None:
 
 
 def _safe_host(url: str) -> str:
-    """host:port 的安全文件名形态(非 [a-zA-Z0-9.-] 一律换 ``_``)。"""
+    """host:port 的安全文件名形态(非 [a-zA-Z0-9.-] 一律换 ``_``)。
+
+    镜像实现锁:同款 host 清洗在 evidence/packager.py 与
+    evidence/parallel_pack.py 各有一份(那边取 hostname、不含端口,与本处
+    取 netloc 含端口的既有口径不同,互不改写;测试 test_parallel_pack
+    已锁定 packager/parallel_pack 两份逐字符一致)。修改字符集/兜底值
+    须三处同步评估,避免证据目录前缀与截图名漂移。
+    """
     netloc = (urlsplit(url).netloc or "unknown").lower()
     return re.sub(r"[^a-zA-Z0-9.-]", "_", netloc)
 
@@ -182,8 +210,8 @@ def _open_page_with_retry(pw: Any, url: str, cfg: Config) -> tuple[Any, Any]:
             if browser is not None:
                 try:
                     browser.close()
-                except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
-                    pass
+                except Exception as exc:  # noqa: BLE001 - 关闭失败不影响主流程
+                    logger.debug("失败路径 browser 关闭失败(忽略):%s", exc)
             if _is_transient_browser_error(exc) and attempt < BROWSER_OPEN_ATTEMPTS:
                 telemetry.inc("capture.transient_retry")
                 logger.info("浏览器打开页面瞬态超时,自动重试(第 %d 次):%s", attempt, url)
@@ -200,7 +228,7 @@ def _screenshot_path(
 
     :param tag: 可选引擎标记(如 capture_v2 传 "v2"),避免与 v1 同秒互撞。
     """
-    stamp = (ts or datetime.datetime.now()).strftime(_SHOT_TS_FORMAT)
+    stamp = (ts or timesource.now_local()).strftime(_SHOT_TS_FORMAT)
     stem = f"{_safe_host(url)}_{tag}_{stamp}" if tag else f"{_safe_host(url)}_{stamp}"
     candidate = os.path.join(evidence_dir, f"{stem}.png")
     if not os.path.exists(candidate):
@@ -211,6 +239,81 @@ def _screenshot_path(
         if not os.path.exists(candidate):
             return candidate
         seq += 1
+
+
+def _collect_evidences(
+    url: str,
+    cfg: Config,
+    html: str,
+    download: Callable[..., Any] | None,
+) -> list[ImageEvidence]:
+    """从 HTML 提取图片链接(截取上限)并落盘为图片证据(无图返回空表)。"""
+    image_urls = _extract_image_urls(html, url)[: max(0, cfg.max_images_per_page)]
+    if not image_urls:
+        return []
+    dest_dir = os.path.join(cfg.evidence_dir, f"{_safe_host(url)}_imgs")
+    os.makedirs(dest_dir, exist_ok=True)
+    dl = download
+    if dl is None:
+        dl = _load_fetcher().download_images
+    return list(dl(image_urls, url, dest_dir, cfg))
+
+
+def _new_page_with_retry(browser: Any, url: str, cfg: Config) -> Any:
+    """在**已打开**的 browser 上 new_page + goto;瞬态超时重试 1 次。
+
+    与 :func:`_open_page_with_retry` 的差异:浏览器实例跨页/跨重试复用
+    (重试只重建 page,不重启浏览器)——供 :func:`capture_pages` 会话复用
+    路径使用;失败 page 先关闭防句柄泄漏。
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(1, BROWSER_OPEN_ATTEMPTS + 1):
+        page = None
+        try:
+            page = browser.new_page()
+            page.goto(url, timeout=int(cfg.fetch_timeout_s * 1000))
+            return page
+        except Exception as exc:  # noqa: BLE001 - 统一分诊:瞬态重试,其余上抛
+            if page is not None:
+                try:
+                    page.close()
+                except Exception as exc:  # noqa: BLE001 - 关闭失败不影响主流程
+                    logger.debug("失败路径 page 关闭失败(忽略):%s", exc)
+            if _is_transient_browser_error(exc) and attempt < BROWSER_OPEN_ATTEMPTS:
+                telemetry.inc("capture.transient_retry")
+                logger.info("浏览器打开页面瞬态超时,自动重试(第 %d 次):%s", attempt, url)
+                last_exc = exc
+                continue
+            raise
+    raise last_exc if last_exc is not None else RuntimeError("浏览器打开页面失败")  # pragma: no cover
+
+
+def _shoot_page_in_browser(browser: Any, url: str, cfg: Config) -> tuple[str, str]:
+    """会话复用路径:在已打开的 browser 上采样单页,返回 (screenshot_path, html)。
+
+    networkidle 容错等待、整页截图与 :func:`_shoot_with_playwright` 同口径;
+    采样完 page 即关(浏览器留给会话里的下一页)。
+    """
+    os.makedirs(cfg.evidence_dir, exist_ok=True)
+    page = None
+    try:
+        page = _new_page_with_retry(browser, url, cfg)
+        try:
+            page.wait_for_load_state(
+                "networkidle", timeout=int(cfg.fetch_timeout_s * 1000)
+            )
+        except Exception as exc:  # noqa: BLE001 - networkidle 常超时,容错继续
+            logger.debug("networkidle 等待超时(忽略):%s", exc)
+        shot = _screenshot_path(cfg.evidence_dir, url)
+        page.screenshot(path=shot, full_page=True)
+        telemetry.inc("capture.screenshot")
+        return shot, page.content()
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception as exc:  # noqa: BLE001 - 关闭失败降级可见(S5 清偿)
+                logger.debug("采样完 page 关闭失败(忽略):%s", exc)
 
 
 def _shoot_with_playwright(
@@ -240,14 +343,14 @@ def _shoot_with_playwright(
         if browser is not None:
             try:
                 browser.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001 - 关闭失败降级可见(S5 清偿)
+                logger.debug("browser 关闭失败(忽略):%s", exc)
         stop = getattr(pw, "stop", None)
         if callable(stop):
             try:
                 stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001 - 关闭失败降级可见(S5 清偿)
+                logger.debug("playwright stop 失败(忽略):%s", exc)
 
 
 def _fetch_html(url: str, cfg: Config, fetch_page: Callable[..., Any] | None) -> str:
@@ -260,6 +363,53 @@ def _fetch_html(url: str, cfg: Config, fetch_page: Callable[..., Any] | None) ->
     return html if status == 200 else ""
 
 
+def _shoot_with_goto_fallback(
+    url: str,
+    cfg: Config,
+    shoot: Callable[[str], tuple[str, str]],
+    fetch_page: Callable[..., Any] | None = None,
+    *,
+    degraded_metric: str = "capture.degraded_pages",
+) -> tuple[str, str]:
+    """goto 超时三级降级链的第②③级包裹器(V10.24,席位2)。
+
+    ``shoot(url)`` 为浏览器路径(内部已含第①级瞬态超时重试);仅当其抛出
+    的异常属超时族(:func:`_is_transient_browser_error`,即重试已用尽)时,
+    整页退回 urllib 退化采样——与"缺 playwright 退化"同源:仅 HTML、
+    **无截图、无懒加载触发**,如实以 ``screenshot_path=""`` 呈现;计
+    ``degraded_metric``(缺省 ``capture.degraded_pages``,v2 传
+    ``capture_v2.degraded_pages``)。非超时类异常不进降级链,原样上抛
+    (安全闸门/实例损坏等既有 fail-fast 语义不变)。
+
+    第③级:urllib 退化也失败(非 200/抛错)时 re-raise **原始超时异常**
+    (退化失败原因已记日志),由调用方决定口径——批量路径(:func:`capture_pages`)
+    记 ``capture.errors`` 后继续其余页,单页路径(:func:`capture_page`)
+    维持异常上抛。
+    """
+    try:
+        return shoot(url)
+    except Exception as exc:
+        if not _is_transient_browser_error(exc):
+            raise
+        telemetry.inc(degraded_metric)
+        logger.warning(
+            "浏览器 goto 超时(重试用尽),整页退回 urllib 退化采样"
+            "(无截图、无懒加载触发):%s(%s)", url, exc,
+        )
+        fetch = fetch_page if fetch_page is not None else _load_fetcher().fetch_page
+        try:
+            status, html, _final = fetch(url, cfg)
+        except Exception as fetch_exc:  # noqa: BLE001 - 退化抛错同样属第③级失败
+            logger.error("urllib 退化采样抛错,该页记页级采样错误:%s(%s)", url, fetch_exc)
+            raise exc from fetch_exc  # 上抛原始超时,退化原因仅在日志留痕
+        if status != 200:
+            logger.error(
+                "urllib 退化采样失败(HTTP %s),该页记页级采样错误:%s", status, url
+            )
+            raise  # re-raise 原始 goto 超时异常(外层 except 上下文)
+        return "", html
+
+
 def capture_page(
     url: str,
     cfg: Config,
@@ -270,10 +420,16 @@ def capture_page(
     """单页采样:截图 + 图片证据下载 + 文本线索命中。
 
     - playwright 可用:导航前过本机闸门,整页截图,html=page.content();
+      goto 超时(瞬态重试用尽)整页退回 urllib 退化采样(计
+      ``capture.degraded_pages``,无截图/无懒加载,详见
+      :func:`_shoot_with_goto_fallback`);退化也失败则原样上抛该超时;
     - playwright 缺失:退化模式(urllib 抓 HTML,截图留空,记 capture.degraded);
     - 图片链接绝对化/去重/去 data: 后截取前 ``cfg.max_images_per_page`` 张,
       经 ``download``(缺省 fetcher.download_images)落盘为 ImageEvidence;
     - 无图片时跳过下载;任何异常记 capture.errors 后原样上抛。
+
+    批量场景(同站多页)优先用 :func:`capture_pages`——一次浏览器会话
+    逐页复用,免每页冷启动(每页省约 0.5~2s)。
     """
     start = time.perf_counter()
     try:
@@ -281,22 +437,18 @@ def capture_page(
             sync_playwright = _import_sync_playwright()
             if sync_playwright is not None:
                 _ensure_local_navigation(url, cfg)
-                screenshot_path, html = _shoot_with_playwright(sync_playwright, url, cfg)
+                screenshot_path, html = _shoot_with_goto_fallback(
+                    url,
+                    cfg,
+                    lambda u: _shoot_with_playwright(sync_playwright, u, cfg),
+                    fetch_page,
+                )
             else:
                 telemetry.inc("capture.degraded")
                 logger.info("未安装 playwright,退化模式采样(无截图):%s", url)
                 screenshot_path, html = "", _fetch_html(url, cfg, fetch_page)
 
-            image_urls = _extract_image_urls(html, url)[: max(0, cfg.max_images_per_page)]
-            evidences: list[ImageEvidence] = []
-            if image_urls:
-                dest_dir = os.path.join(cfg.evidence_dir, f"{_safe_host(url)}_imgs")
-                os.makedirs(dest_dir, exist_ok=True)
-                dl = download
-                if dl is None:
-                    dl = _load_fetcher().download_images
-                evidences = list(dl(image_urls, url, dest_dir, cfg))
-
+            evidences = _collect_evidences(url, cfg, html, download)
             hints = _match_text_hints(html)
         elapsed = time.perf_counter() - start
         if elapsed > SLOW_CAPTURE_WARN_S:
@@ -310,3 +462,146 @@ def capture_page(
     except Exception:
         telemetry.inc("capture.errors")
         raise
+
+
+@contextmanager
+def browser_session(cfg: Config) -> Iterator[Any | None]:
+    """可复用浏览器会话原语(V10.13 会话复用/创世纪 G1 抽出的通用骨架)。
+
+    一次 ``sync_playwright`` 启动 + 一次 ``chromium.launch(headless=True)``,
+    ``with`` 体内产出 browser 实例供逐页 ``new_page`` 复用;退出(含异常)
+    时在 finally 中统一回收 browser.close 与 pw.stop(双 try 容错)。
+
+    - playwright 缺失时产出 ``None``(不抛出),调用方据此自行走退化路径
+      (如 :func:`capture_pages` 逐页 :func:`capture_page`),退化语义不变;
+    - 会话成功建立时计 ``telemetry.inc("capture.session_reuse")``;
+    - 导航安全闸门不在本原语内:逐页导航前仍须各自过
+      :func:`_ensure_local_navigation`(安全红线不集中、不放松)。
+
+    供 :func:`capture_pages`(v1 批量)与 ``capture_v2.capture_pages_v2``
+    (v2 批量)等批量采集入口共用;单页路径(:func:`capture_page`)不走
+      会话,维持逐次冷启动语义。
+    """
+    sync_playwright = _import_sync_playwright()
+    if sync_playwright is None:
+        yield None
+        return
+    pw_ctx = sync_playwright()
+    pw = pw_ctx.start() if hasattr(pw_ctx, "start") else pw_ctx
+    browser = None
+    try:
+        browser = pw.chromium.launch(headless=True)
+        telemetry.inc("capture.session_reuse")
+        yield browser
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception as exc:  # noqa: BLE001 - 关闭失败降级可见(S5 清偿)
+                logger.debug("会话 browser 关闭失败(忽略):%s", exc)
+        stop = getattr(pw, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception as exc:  # noqa: BLE001 - 关闭失败降级可见(S5 清偿)
+                logger.debug("会话 playwright stop 失败(忽略):%s", exc)
+
+
+def capture_pages_iter(
+    urls: list[str],
+    cfg: Config,
+    *,
+    fetch_page: Callable[..., Any] | None = None,
+    download: Callable[..., Any] | None = None,
+) -> Iterator[PageSample]:
+    """流式批量采样(P1-3 生产者内核):逐页**即时产出**,会话随耗尽/提前关闭回收。
+
+    与 :func:`capture_pages` 同一内核(会话复用 / 三级降级 / 页级容错 /
+    闸门语义逐项一致),唯一差别是产出方式:每页采样完成立即 ``yield``,
+    使调用方(编排器流水线)能在后续页仍在爬取时就开始处理已到手页。
+    ``capture_pages = list(capture_pages_iter(...))``,外部 list 语义零变化。
+
+    提前关闭(调用方 ``gen.close()`` / for-break):``GeneratorExit`` 在
+    yield 点抛入,``browser_session`` 上下文正常回收浏览器会话;已产出
+    页的样本与遥测不受影响。
+    """
+    if not urls:
+        return
+    with browser_session(cfg) as browser:
+        if browser is None:
+            for u in urls:
+                yield capture_page(u, cfg, fetch_page=fetch_page, download=download)
+            return
+        logger.info("批量采样会话复用:%d 页共用一次浏览器启动", len(urls))
+        for u in urls:
+            start = time.perf_counter()
+            try:
+                with telemetry.timer("capture.page"):
+                    _ensure_local_navigation(u, cfg)
+                    shot, html = _shoot_with_goto_fallback(
+                        u,
+                        cfg,
+                        lambda page_url: _shoot_page_in_browser(browser, page_url, cfg),
+                        fetch_page,
+                    )
+                    evidences = _collect_evidences(u, cfg, html, download)
+                    hints = _match_text_hints(html)
+                elapsed = time.perf_counter() - start
+                if elapsed > SLOW_CAPTURE_WARN_S:
+                    logger.warning(
+                        "慢采样(%.1fs > %.1fs):%s", elapsed, SLOW_CAPTURE_WARN_S, u
+                    )
+                yield PageSample(
+                    url=u,
+                    screenshot_path=shot,
+                    image_evidences=evidences,
+                    text_hint_hits=hints,
+                )
+            except Exception as exc:
+                telemetry.inc("capture.errors")
+                if _is_transient_browser_error(exc):
+                    # 第③级落地:goto 超时且 urllib 退化也未果 → 页级错误,
+                    # 不杀整扫,继续其余页(样本数变少如实呈现)。
+                    logger.error(
+                        "页面 %s goto 超时且 urllib 退化采样均失败,"
+                        "记页级采样错误,继续其余页(%s)", u, exc,
+                    )
+                    continue
+                raise
+
+
+def capture_pages(
+    urls: list[str],
+    cfg: Config,
+    *,
+    fetch_page: Callable[..., Any] | None = None,
+    download: Callable[..., Any] | None = None,
+) -> list[PageSample]:
+    """批量采样(会话复用):**一次** Playwright 启动 + 浏览器 launch,
+    逐页 ``new_page`` 采样,全部完成后统一关闭。
+
+    - playwright 可用:导航前逐页过本机闸门;每页采样口径(goto 瞬态重试 /
+      networkidle 容错 / 整页截图 / 图片证据 / 文本线索 / 慢采样告警 /
+      capture.page 计时 / capture.errors 计数)与 :func:`capture_page`
+      逐项一致;goto 超时走三级降级链(:func:`_shoot_with_goto_fallback`):
+      重试用尽 → urllib 退化采样(计 ``capture.degraded_pages``,无截图/
+      无懒加载)→ 退化也失败则**记页级采样错误(``capture.errors``)并继续
+      其余页**(页级失败绝不杀整扫,站点报告照常产出,样本数变少如实呈现,
+      V10.24);非超时类异常仍原样上抛(fail-fast,与逐页调用的传播语义
+      相同),会话在 finally 中统一回收;
+    - playwright 缺失 / 空列表:逐页退回 :func:`capture_page`(各自走
+      退化模式),行为与逐页调用完全一致;
+    - 安全不变:``allow_network=False`` 闸门逐页生效,外网一律拒绝。
+
+    性能背景:此前同站扫描每页各做一次 ``sync_playwright().start()`` +
+    ``chromium.launch()`` + close + stop(冷启动 0.5~2s/页);本函数把
+    会话成本摊到整站,页数越多收益越大(V10.13)。会话生命周期由
+    :func:`browser_session` 原语统一管理(等价重构,行为不变)。
+
+    P1-3 起内核为 :func:`capture_pages_iter`(逐页流式产出),本函数仅
+    物化为 list——list 语义与流式化之前逐字节一致;需要重叠消费的调用
+    方(编排器流水线)直接使用 iter 内核。
+    """
+    return list(
+        capture_pages_iter(urls, cfg, fetch_page=fetch_page, download=download)
+    )

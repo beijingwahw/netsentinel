@@ -51,6 +51,12 @@ from typing import Any
 from netsentinel import telemetry
 from netsentinel.contracts import now_iso
 
+#: SQLite 忙等上限(毫秒):与 review_queue / batch_review 等存储模块同一
+#: 策略;V10.24 起自 :mod:`netsentinel.storage.kernel` 单源再导出
+#: (storage/event_log 同款,名字 / __all__ / 取值 5000 均不变)。
+from netsentinel.storage.kernel import BUSY_TIMEOUT_MS
+from netsentinel.storage.kernel import connect as sqlite_connect
+
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "RESUME_STATUSES",
@@ -60,9 +66,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-#: SQLite 忙等上限(毫秒):与 review_queue / batch_review 等存储模块同一策略。
-BUSY_TIMEOUT_MS: int = 5000
 
 #: 合法条目状态(固定六值;mark 之外的一切取值 → 中文 ValueError)
 VALID_STATUSES: frozenset[str] = frozenset(
@@ -212,11 +215,10 @@ class BatchState:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = sqlite_connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        # 与全仓一致:WAL + 忙等 5s(读写并发 / 跨进程锁等待)
-        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # V10.21:连接统一经 storage.kernel.connect 工厂(全仓唯一
+        # sqlite3.connect 入口);WAL + 忙等 5s 由工厂内置,口径不变。
         self._conn.execute(_SCHEMA_BATCHES_SQL)
         self._conn.execute(_SCHEMA_ITEMS_SQL)
         self._conn.execute(_INDEX_SQL)

@@ -43,6 +43,7 @@ from typing import Any, Callable
 
 from netsentinel import telemetry
 from netsentinel.contracts import Config, ImageEvidence, ImageScore
+from netsentinel.vision._vlm_helpers import clamp01 as _clamp01
 
 __all__ = ["GENERIC_NAME", "UniversalVLMClassifier", "build_classifier"]
 
@@ -90,13 +91,8 @@ class _ModuleNotReady(RuntimeError, ValueError):
 
 
 # ---------------------------------------------------------------------------
-# 小工具
+# 小工具(_clamp01 的单一实现在 _vlm_helpers,顶部按原名导入)
 # ---------------------------------------------------------------------------
-
-
-def _clamp01(value: float) -> float:
-    """收敛到 [0, 1]。"""
-    return min(1.0, max(0.0, float(value)))
 
 
 def _to_float(value: Any) -> float | None:
@@ -165,6 +161,15 @@ def _should_reraise(exc: BaseException) -> bool:
         return True
     reraise_names = ("VlmConfigError", "ModelNotFoundError", "VlmBudgetExceeded")
     return any(klass.__name__ in reraise_names for klass in type(exc).__mro__)
+
+
+def _is_model_not_found_error(exc: BaseException) -> bool:
+    """判定异常是否"模型不存在"(:class:`vlm_client.ModelNotFoundError`)。
+
+    按类名沿 MRO 匹配(与 :func:`_should_reraise` 同款,注入的替身客户端
+    携带同名异常类时同样生效,不硬导入 vlm_client)。
+    """
+    return any(klass.__name__ == "ModelNotFoundError" for klass in type(exc).__mro__)
 
 
 # ---------------------------------------------------------------------------
@@ -275,12 +280,17 @@ class UniversalVLMClassifier(NsfwClassifier):
 
     构造参数(均可注入,测试/演示零外呼)::
 
-        UniversalVLMClassifier(cfg, resolved=None, client=None, cache=None)
+        UniversalVLMClassifier(cfg, resolved=None, client=None, cache=None,
+                               negotiate_fn=None)
 
     - ``resolved``:providers.ResolvedProvider 鸭子(base_url/model/api_key/
       style/local[, provider]);缺省在首次调用时按 ``cfg.vlm_provider`` 惰性解析;
     - ``client``:缺省用 ``vlm_client.UniversalVLMClient(resolved, cfg)``;
-    - ``cache``:缺省用 ``vlm_cache.VlmCache(cfg.vlm_cache_db, cfg.vlm_daily_budget)``。
+    - ``cache``:缺省用 ``vlm_cache.VlmCache(cfg.vlm_cache_db, cfg.vlm_daily_budget)``;
+    - ``negotiate_fn``:(A71 接线)模型名协商函数替身,签名
+      ``fn(provider, model, cfg) -> 新模型名``;缺省惰性调用
+      ``model_negotiate.negotiate``。协商回退本身默认关,开启方式与代价见
+      :meth:`_negotiate_and_retry`。
 
     实例属性 ``name`` 定格为 ``提供方:模型``(模型空则仅提供方),同时作为
     VLM 缓存键的模型维度;类属性注册名为 ``"vlm"``(泛型入口)。
@@ -288,6 +298,7 @@ class UniversalVLMClassifier(NsfwClassifier):
 
     #: 类级注册名(注册表键);实例构造后 ``self.name`` 被覆盖为 "提供方:模型"。
     name = GENERIC_NAME
+    consumes_vlm_budget = True  # P1-5:评分消耗 VlmCache 日预算(远程 VLM 家族)
 
     def __init__(
         self,
@@ -296,12 +307,17 @@ class UniversalVLMClassifier(NsfwClassifier):
         resolved: Any = None,
         client: Any = None,
         cache: Any = None,
+        negotiate_fn: Callable[..., str] | None = None,
     ) -> None:
         # cfg 位置参数兼容 classifier_base.get_classifier 的 cls(cfg) 工厂调用
         self._cfg = cfg if cfg is not None else Config()
         self._resolved = resolved
         self._client = client
         self._cache = cache
+        # (A71 接线)模型名协商函数注入点(测试替身);缺省 None → 惰性调用
+        # netsentinel.vision.model_negotiate.negotiate。默认关,见
+        # :meth:`_negotiate_and_retry` 的开关说明。
+        self._negotiate_fn = negotiate_fn
         if resolved is not None:
             self._apply_identity(
                 str(getattr(resolved, "provider", "") or ""),
@@ -568,14 +584,23 @@ class UniversalVLMClassifier(NsfwClassifier):
         # 3) 预算一本账(红线 19):真实外呼前必经 spend_one,超限上抛
         cache.spend_one()
 
-        # 4) 统一客户端外呼(A62 三方言;VlmConfigError/ModelNotFoundError 上抛)
+        # 4) 统一客户端外呼(A62 三方言;VlmConfigError/ModelNotFoundError 上抛;
+        #    A71 协商回退默认关,开启时 ModelNotFoundError 换名重试一次)
         client = self._get_client()
         system_text, user_text = self._build_prompts(prompts, img)
         messages = [
             {"role": "system", "content": system_text},
             {"role": "user", "content": user_text},
         ]
-        data = client.chat_json(messages, image_paths=[img.path])
+        try:
+            data = client.chat_json(messages, image_paths=[img.path])
+        except Exception as exc:
+            if (
+                not _is_model_not_found_error(exc)
+                or not bool(getattr(self._cfg, "model_negotiate_enabled", False))
+            ):
+                raise  # 非模型不存在 / 未开启协商:原样上抛(与接线前逐字一致)
+            data = self._negotiate_and_retry(client, messages, img, cache, exc)
 
         # 5) 校验 + 校准(注入防御:只提取数值字段,其余键一律丢弃)
         prob, meta = self._validate_and_calibrate(data, prompts)
@@ -602,6 +627,81 @@ class UniversalVLMClassifier(NsfwClassifier):
             cache.put(self.name, prompt_version, image_key, payload)
 
         return self._score_from_payload(img, payload)
+
+    # ------------------------------------------------------------------
+    # (A71 接线)模型名协商回退:默认关,cfg 附加属性 model_negotiate_enabled 开启
+    # ------------------------------------------------------------------
+
+    def _negotiate_and_retry(
+        self,
+        client: Any,
+        messages: list[dict],
+        img: ImageEvidence,
+        cache: Any,
+        exc: Exception,
+    ) -> dict:
+        """模型名协商换名重试一次(默认关;仅 ``ModelNotFoundError`` 路径可达)。
+
+        开启方式:在构造调用链入口给 cfg 挂**附加实例属性**
+        ``cfg.model_negotiate_enabled = True``(getattr 动态读取,与
+        ``cost_ledger_enabled`` 同款,不新增 Config 字段);缺省 ``False``
+        时本方法不可达,``ModelNotFoundError`` 照旧上抛,行为与接线前
+        逐字一致(项目红线:新接线默认关闭)。
+
+        代价(开启前必读):
+
+        - 协商的**每一跳候选探测都是真实外呼**,探测前必经
+          ``spend_one`` 记账(A71 内部经 ``vlm_cache`` 自己的预算闸门,
+          预算尽 → 协商失败,原 ``ModelNotFoundError`` 上抛,绝不静默超支);
+        - 换名重试本身也是一次真实外呼,重试前在本分类器的同一本预算账
+          上再 ``spend_one`` 一次(红线 19:重试不是免费的);
+        - 协商成功即**进程内定格**(A71 ``_NEGOTIATED``):同一
+          ``提供方:模型`` 的后续首调零额外探测直接复用;本实例还会把
+          协商出的新模型名定格到 ``client.model``,后续 classify 不再
+          触发协商路径。缓存键维度(实例名)保持原身份不变,实际应答
+          模型记入 ``scores["vlm_model"]``(诚实观测,不冒充)。
+
+        :raises Exception: 协商失败 → 原样上抛入参 ``exc``(保持
+            ``ModelNotFoundError`` 语义,orchestrator 成员循环据此跳过);
+            协商成功但重试仍失败 → 上抛重试的异常。
+        """
+        try:
+            new_model = self._negotiate_model_name()
+        except Exception as neg_exc:  # noqa: BLE001 - 协商失败回退原语义
+            logger.warning(
+                "%s:%s 模型名协商失败,按原语义上抛模型不存在错误:%s",
+                _DEGRADE_NOTE,
+                self.name,
+                neg_exc,
+            )
+            raise exc
+        # 重试前再记一次账(红线 19:换名重试也是一次真实外呼;预算尽原样上抛)
+        cache.spend_one()
+        previous_model = getattr(client, "model", None)
+        try:
+            client.model = new_model  # 定格新名:本实例后续调用直接用,零重复协商
+        except Exception:  # noqa: BLE001 - 只读/受控属性无法定格时原样重试一次
+            pass
+        logger.info(
+            "%s:%s 模型不存在,经 A71 协商换名重试:%s → %s",
+            _DEGRADE_NOTE,
+            self.name,
+            previous_model or "(未指定)",
+            new_model,
+        )
+        telemetry.inc("vision.negotiate.retry")  # V10.18 可观测补齐:纯遥测,零行为变化
+        return client.chat_json(messages, image_paths=[img.path])
+
+    def _negotiate_model_name(self) -> str:
+        """取协商函数:注入的 ``negotiate_fn`` 优先,缺省惰性调 A71 negotiate。
+
+        签名(注入替身须一致):``fn(provider, model, cfg) -> 新模型名``。
+        """
+        if self._negotiate_fn is not None:
+            return str(self._negotiate_fn(self._provider, self._model, self._cfg))
+        from netsentinel.vision import model_negotiate  # 惰性导入,不硬依赖
+
+        return str(model_negotiate.negotiate(self._provider, self._model, self._cfg))
 
 
 # ---------------------------------------------------------------------------

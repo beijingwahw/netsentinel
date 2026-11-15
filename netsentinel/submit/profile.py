@@ -232,9 +232,22 @@ def save_permanent(values: dict[str, str]) -> Path:
 
 
 def setup_interactive(*, stdin=None, stdout=None) -> Path:
-    """交互式逐字段录入,一次写入永久模板。"""
+    """交互式逐字段录入,一次写入永久模板。
+
+    V10.20 EOF 韧性:注入流读尽(``readline()`` 返回空串)与交互终端
+    Ctrl+D/Ctrl+Z 同语义——统一抛 :class:`EOFError`,由 :func:`main`
+    收敛为中文取消提示(退出码 1),不再裸抛 traceback、也绝不因
+    "必填项为空重复询问"在注入流 EOF 上死循环。
+    """
     _print = (lambda t: print(t, file=stdout)) if stdout else print
-    _input = (lambda p: (stdin.readline().strip() if stdin else input(p)))
+
+    def _input(p: str) -> str:
+        if stdin is not None:
+            line = stdin.readline()
+            if line == "":  # 注入流 EOF(空行是 "\n",不会走到这里)
+                raise EOFError
+            return line.strip()
+        return input(p).strip()
 
     existing = _read_yaml(permanent_path())
     _print("=" * 60)
@@ -250,7 +263,7 @@ def setup_interactive(*, stdin=None, stdout=None) -> Path:
         while True:
             suffix = f" [{current[:4]}…]" if current and len(current) > 6 else (
                 f" [{current}]" if current else "")
-            raw = _input(f"  {prompt_text}{suffix}: ").strip()
+            raw = _input(f"  {prompt_text}{suffix}: ")
             val = raw or current
             if not val and f in REQUIRED_FIELDS:
                 _print(f"  ⚠ {FIELD_LABELS.get(f)}为必填,不能为空")
@@ -288,7 +301,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "setup":
-        setup_interactive()
+        try:
+            setup_interactive()
+        except EOFError:
+            # 管道读尽 / 终端 Ctrl+D(Ctrl+Z):取消配置,模板零改动
+            print("输入中断(EOF):本次配置已取消,永久模板未改动")
+            return 1
+        except KeyboardInterrupt:
+            print("\n已取消(Ctrl+C):永久模板未改动")
+            return 130
         return 0
 
     if args.command == "show":
